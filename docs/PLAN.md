@@ -91,10 +91,16 @@ Top-k retrieval is the wrong tool for summaries, because an overview needs **cov
 ## [new] AgentAUS provider (branch)
 
 **Decision:** add AgentAUS, a sovereign Australian model from Trellis Data
-with an OpenAI-compatible `/v1` API, as an alternative LLM provider, and
-make it the default on this branch. Claude stays available as a config
-switch (`NOTECAST_PROVIDER=anthropic`). Retrieval (fastembed) and audio TTS
-(Kokoro) are unchanged either way — they never call an LLM.
+with an OpenAI-compatible API, as an alternative LLM provider, and make it
+the default on this branch. Claude stays available as a config switch
+(`NOTECAST_PROVIDER=anthropic`). Retrieval (fastembed) and audio TTS
+(Kokoro) are unchanged either way — they never call an LLM. The owner has
+now measured the real endpoint, so the defaults in `notecast/config.py` are
+the real values, not placeholders: base URL
+`https://agentaus.com.au/api/v1` (the `/api` matters — plain `/v1` redirects
+to a login page), model `agentaus.v1` (the only one `/models` lists; the
+server accepts any model name and just replies as "agentaus"), context
+window 131,072 tokens (input + output).
 
 The adapter (`notecast/providers/openai_compat.py`, `OpenAICompatClient`)
 presents the same interface the rest of NoteCast expects from the Claude
@@ -104,27 +110,51 @@ citations via numbered `<source id="n">` prompts and `[n]` markers mapped
 back to file + page/slide/timestamp, and structured JSON output (audio key
 points, scripts, coverage check) via a described JSON Schema plus
 `response_format={"type": "json_object"}` when
-`NOTECAST_AGENTAUS_JSON_MODE=true`, falling back automatically if the
-server rejects that parameter. `<think>` reasoning blocks in responses are
-stripped before parsing. A new `notecast provider-check` command prints the
-active provider/models, lists what the endpoint offers, and sends a small
-ping request, for confirming the key/base URL/model ID.
+`NOTECAST_AGENTAUS_JSON_MODE=true`. AgentAUS accepts that parameter but
+doesn't enforce it, so the real safety net is that NoteCast validates every
+JSON reply and retries once with a "JSON only" instruction; the
+automatic-fallback-if-rejected behaviour is still there for other
+OpenAI-compatible servers, it just isn't what's doing the work here. Every
+call also sends `system_prompt_overwrite: true`
+(`NOTECAST_AGENTAUS_SYSTEM_PROMPT_OVERWRITE`, default on), replacing
+Trellis's hidden ~2,400-token default system prompt with NoteCast's own
+(~130 tokens), which matters a lot for cost and latency since there's no
+prompt caching. No `<think>` tags have actually been observed from AgentAUS
+(its reasoning is hidden but still counts toward output tokens); NoteCast
+strips the rare leaks it has seen instead — leading plain-text reasoning
+lines and raw control tokens. A new `notecast provider-check` command
+prints the active provider/models, lists what the endpoint offers, and
+sends a small ping request, for confirming the key/base URL/model ID.
 
 **Known trade-offs vs Claude** (see [`docs/AGENTAUS.md`](AGENTAUS.md) for
 the full table):
 - Citations are emulated, not native — the cited span is the whole source
   excerpt rather than the exact cited sentence.
-- No server-side web search in open mode; open mode with AgentAUS is
-  sources + model knowledge only.
+- No web search tool of NoteCast's own in open mode; open mode with
+  AgentAUS is sources + model knowledge only. (AgentAUS does have its own
+  built-in web search, which can switch on uninvited even with
+  `tool_choice: none` and add 20k–100k input tokens to a call — a known
+  cause of occasional slow calls or context-overflow errors, not something
+  NoteCast controls.)
 - No prompt caching, so deep mode resends the full scope every turn —
   slower and pricier per follow-up than with Claude.
-- Deep mode is capped at `NOTECAST_AGENTAUS_CONTEXT_TOKENS` (default
-  128,000 tokens) instead of Claude's ~1M-token window.
-- Max output per request capped by `NOTECAST_AGENTAUS_MAX_OUTPUT_TOKENS`
-  (default 8192).
-- Cost estimates only show up if `NOTECAST_AGENTAUS_PRICE_INPUT_PER_MTOK` /
-  `..._OUTPUT_PER_MTOK` are set, since AgentAUS pricing isn't wired into
-  NoteCast's defaults the way Claude's is.
+- Deep mode is capped at `NOTECAST_AGENTAUS_CONTEXT_TOKENS` (131,072 tokens,
+  input + output; deep mode budgets to roughly 119k tokens of material)
+  instead of Claude's ~1M-token window.
+- Output length isn't actually controlled by
+  `NOTECAST_AGENTAUS_MAX_OUTPUT_TOKENS` — AgentAUS ignores `max_tokens` and
+  self-limits every reply to roughly 2,500 words (~100 tokens/sec; longest
+  observed ~6.7k tokens including hidden reasoning). NoteCast's audio
+  chapters (~850 words, up to 8 for a 45-minute episode) and a compact
+  merge-and-rank output format for AgentAUS are sized to fit under that;
+  pushing `NOTECAST_AUDIO_MAX_MINUTES` well past 45 risks chapters that
+  don't fit in one reply.
+- No cheaper helper model exists — `/models` lists exactly one model, so
+  `NOTECAST_AGENTAUS_HELPER_MODEL` has nothing to point at yet.
+- Cost estimates show `n/a` unless you set
+  `NOTECAST_AGENTAUS_PRICE_INPUT_PER_MTOK` / `..._OUTPUT_PER_MTOK` yourself
+  — AgentAUS pricing isn't published, and the owner has unlimited usage on
+  the current key, so this is expected rather than a gap to fix.
 
 ## 6. [new] Evaluation (small but essential)
 
@@ -179,9 +209,12 @@ Phase 1 must be solid before anything else, same as the original plan.
   turning it on by default.
 - **Quiz / flashcards (Phase 8).** Not started; see the Phase 8 idea list in
   `docs/LEARN.md`.
-- **Live test against AgentAUS.** The provider adapter is unit-tested with
-  the API mocked (same as Claude), but nothing has been run against a real
-  AgentAUS endpoint yet — need to confirm the actual context window, max
-  output tokens, and whether `response_format={"type": "json_object"}` is
-  supported, plus get real pricing to fill in
-  `NOTECAST_AGENTAUS_PRICE_INPUT_PER_MTOK` / `..._OUTPUT_PER_MTOK`.
+- **Live test against AgentAUS.** The owner has measured the real endpoint
+  (context window, output behaviour, JSON mode, system prompt overwrite —
+  see the section above and `notecast/config.py`), so context window, max
+  output tokens, JSON mode support, and pricing (unpublished, unlimited
+  usage on the current key, so left unset by design) are answered. What's
+  still pending is a full live end-to-end run with the owner's real key —
+  ingest → ask/chat in all three modes → generate and listen to an audio
+  overview — against AgentAUS specifically, the way Phase 7 still needs for
+  Claude.
