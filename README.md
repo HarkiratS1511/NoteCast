@@ -31,12 +31,12 @@ Audio overviews use the same grounding, then script ► Kokoro TTS (two voices) 
 | Layer | Choice |
 |---|---|
 | Language | Python 3.11+, managed with `uv` |
-| Parsing | `pymupdf` (PDF), `python-pptx`, `python-docx`, `webvtt-py` / `srt`; `faster-whisper` for raw audio/video |
+| Parsing | `pymupdf` (PDF), `python-pptx`, `python-docx`, `webvtt-py` / `srt` |
 | Vector store | LanceDB (embedded, built-in full-text search for hybrid retrieval) |
 | Embeddings | Local `BAAI/bge-small-en-v1.5` by default, swappable (Voyage optional) |
 | LLM | Claude API via the official `anthropic` SDK, with native citations, prompt caching, and web search |
 | TTS | Kokoro (default), Piper (fallback); `pydub` + `ffmpeg` for stitching |
-| UI | To be decided (see open questions in the plan) |
+| UI | Streamlit (local web UI) + thin CLI |
 
 ## Layout (planned)
 

@@ -2,6 +2,15 @@
 
 This builds on the original plan (per-course notebooks → ingest → embed → grounded chat → audio overview). Changes from that draft are marked **[changed]** or **[new]**, with the reason.
 
+## Decisions (2026-09-26)
+
+| Topic | Decision |
+|---|---|
+| Interface | **Streamlit local web UI** on top of a Python core with a thin CLI for ingest/scripting. The core is UI-agnostic, so a React front end can be added later. |
+| Sources | **PDF, PPTX, DOCX, VTT/SRT/TXT/MD.** Whisper transcription and OCR are dropped from scope (they can go back into Phase 8 later). |
+| Hardware | **Windows/Linux + NVIDIA GPU.** Embeddings, reranker and Kokoro run on CUDA when available and fall back to CPU. `ffmpeg` is a documented prerequisite. |
+| API budget | **Cheapest.** Chat defaults to Sonnet 5, and query rewriting and other helper calls use Haiku 4.5. Audio scripts use Sonnet 5 too. Opus isn't used by default and is a config switch. Deep mode is opt-in and shows an estimated token cost before sending. Prompt caching is on wherever the prefix repeats. |
+
 ---
 
 ## 1. Notebooks = per-course folders + one LanceDB table each
@@ -28,8 +37,6 @@ notebooks/<course-slug>/
 | DOCX | `python-docx` | heading path |
 | VTT / SRT | `webvtt-py` / `srt` | start/end timestamp |
 | TXT / MD | built-in | heading path |
-| **[new]** MP3 / MP4 / M4A | `faster-whisper` → VTT, then as above | timestamp |
-| **[new]** Scanned PDFs | OCR fallback (`ocrmypdf`/Tesseract) when a page has no text layer | page |
 
 **Chunking [changed]:** structure-aware, not fixed-size.
 - Slides: one chunk per slide (title + body + notes).
@@ -52,7 +59,7 @@ notebooks/<course-slug>/
 - **Open mode:** same retrieval, plus Claude's own knowledge and the server-side **web search tool**. The UI labels which parts came from your notes, which came from the web, and which are uncited model knowledge.
 - **[new] "Deep" mode (full-context).** Claude now has a **1M-token context window** on current models, so a week's worth of material (or a whole course for many units) can go in **directly**, cached with **prompt caching** so follow-up questions are cheap. This works better than top-k for "compare lecture 2 and lecture 5" or "what are all the assumptions in this unit" questions, where retrieval tends to miss pieces. Default stays RAG, and Deep mode is a toggle.
 - Multi-turn: keep chat history. Rewrite follow-ups ("what about the second one?") into standalone queries before retrieval.
-- Model IDs are in config. Suggested defaults: **Sonnet 5** (`claude-sonnet-5`, $2/$10 per M tokens) for chat, **Opus 5** (`claude-opus-5`) for audio scripts and Deep mode, **Haiku 4.5** for cheap query rewriting.
+- Model IDs are in config. Defaults (cheapest profile): **Sonnet 5** (`claude-sonnet-5`, $2/$10 per M tokens) for chat, audio scripts and Deep mode; **Haiku 4.5** (`claude-haiku-4-5`) for query rewriting and helper calls. Opus is optional.
 
 ## 5. Audio overview [changed: coverage over similarity]
 
@@ -75,9 +82,12 @@ A `tests/eval/` set of ~20–30 question/answer/source triples per test course, 
 
 This is how we'll know if hybrid search, the reranker, or chunk size changes actually help.
 
-## 7. Interface: to be decided (see questions)
+## 7. Interface: Streamlit
 
-Options: CLI only → Streamlit/Gradio web UI → FastAPI + a proper React front end.
+- Sidebar: notebook picker, create a notebook, drag-and-drop upload, ingest button with progress, mode toggle (Sources only / Open / Deep), scope filters (week, file type).
+- Main pane: chat with inline citation chips. Clicking one shows the source excerpt with its page, slide or timestamp.
+- Audio tab: pick scope, format and length, generate, then play or download with the transcript.
+- A thin CLI (`notecast ingest|chat|audio`) sits on the same core for scripting.
 
 ---
 
@@ -95,6 +105,6 @@ Parallel tracks are in brackets; they run as simultaneous Sonnet builders.
 | **5. Multi-notebook** | create/list/switch/delete courses, scope filters | single builder |
 | **6. Audio overview** | scope gather → outline → script JSON → Kokoro TTS → stitch | [script gen] [TTS+stitch] |
 | **7. UI** | chosen front end | depends on choice |
-| **8. Extras** | whisper transcription, OCR, quiz/flashcards/study guide | parallel per feature |
+| **8. Extras** | quiz/flashcards/study guide; later maybe Whisper transcription and OCR | parallel per feature |
 
 Phase 1 must be solid before anything else, same as the original plan.
