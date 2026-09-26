@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
+import tempfile
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -52,19 +54,36 @@ def _chunks_path(nb: Notebook, source_path: str) -> Path:
     return nb.processed_dir / f"{source_path}.chunks.jsonl"
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write `text` to `path` atomically: write to a temp file in the same
+    directory, then `os.replace` it into place (an atomic rename on POSIX
+    and Windows alike), so a crash or error mid-write never leaves a
+    truncated/partial file at `path` -- readers either see the old content
+    or the fully-written new content, never something in between.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def _write_processed(nb: Notebook, source_path: str, doc: object) -> None:
     path = _processed_json_path(nb, source_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(doc.model_dump_json(indent=2), encoding="utf-8")  # type: ignore[union-attr]
+    _atomic_write_text(path, doc.model_dump_json(indent=2))  # type: ignore[union-attr]
 
 
 def _write_chunks(nb: Notebook, source_path: str, chunks: list[Chunk]) -> None:
     path = _chunks_path(nb, source_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        for chunk in chunks:
-            f.write(chunk.model_dump_json())
-            f.write("\n")
+    content = "".join(f"{chunk.model_dump_json()}\n" for chunk in chunks)
+    _atomic_write_text(path, content)
 
 
 def _delete_processed(nb: Notebook, source_path: str) -> None:

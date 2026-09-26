@@ -284,6 +284,65 @@ def test_self_heal_repairs_manually_deleted_rows(tmp_notebooks_root: Path) -> No
     assert "a.txt" in store2.sources()
 
 
+def test_repair_missing_chunks_file_reparses_same_run(tmp_notebooks_root: Path) -> None:
+    nb = _make_notebook(tmp_notebooks_root)
+    _write_source(nb, "a.txt", "Content about smoothing techniques in NLP.\n" * 5)
+    _write_source(nb, "b.txt", "Content about pagerank in graphs.\n" * 5)
+
+    embedder = CountingEmbedder()
+    first = index_notebook(nb, embedder=embedder)
+    assert first.total_chunks > 0
+
+    # Lose "a.txt"'s processed chunks file, and its rows from the store
+    # (so the manifest/store mismatch that triggers repair is present).
+    (nb.processed_dir / "a.txt.chunks.jsonl").unlink()
+    store = open_store(nb, embedder=embedder)
+    store.delete_source("a.txt")
+    store.rebuild_text_index()
+
+    result = index_notebook(nb, embedder=embedder)
+
+    assert "a.txt" not in result.repaired
+    assert result.ingest.added == ["a.txt"]
+    assert result.ingest.failed == {}
+
+    store2 = open_store(nb, embedder=embedder)
+    assert store2.count() == first.total_chunks
+    assert "a.txt" in store2.sources()
+
+
+def test_repair_corrupt_chunks_file_reparses_same_run_others_unaffected(
+    tmp_notebooks_root: Path,
+) -> None:
+    nb = _make_notebook(tmp_notebooks_root)
+    _write_source(nb, "a.txt", "Content about smoothing techniques in NLP.\n" * 5)
+    _write_source(nb, "b.txt", "Content about pagerank in graphs.\n" * 5)
+
+    embedder = CountingEmbedder()
+    first = index_notebook(nb, embedder=embedder)
+    assert first.total_chunks > 0
+
+    (nb.processed_dir / "a.txt.chunks.jsonl").write_text(
+        "{not valid json at all\n", encoding="utf-8"
+    )
+    store = open_store(nb, embedder=embedder)
+    store.delete_source("a.txt")
+    store.rebuild_text_index()
+
+    result = index_notebook(nb, embedder=embedder)
+
+    assert "a.txt" not in result.repaired
+    assert result.ingest.added == ["a.txt"]
+    assert result.ingest.failed == {}
+    # "b.txt" was never touched by any of this.
+    assert "b.txt" not in result.ingest.added
+    assert "b.txt" not in result.ingest.updated
+
+    store2 = open_store(nb, embedder=embedder)
+    assert store2.count() == first.total_chunks
+    assert store2.sources() == {"a.txt", "b.txt"}
+
+
 def test_search_finds_the_right_chunk(tmp_notebooks_root: Path) -> None:
     nb = _make_notebook(tmp_notebooks_root)
     _write_source(

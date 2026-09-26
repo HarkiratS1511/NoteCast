@@ -5,6 +5,7 @@ ready-to-use `Retriever` for chat/search/eval.
 
 from __future__ import annotations
 
+import logging
 import shutil
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -20,6 +21,8 @@ from notecast.models import Chunk
 if TYPE_CHECKING:
     from notecast.config import Settings
     from notecast.notebook import Notebook
+
+logger = logging.getLogger(__name__)
 
 _EMBED_BATCH_SIZE = 64
 
@@ -63,6 +66,15 @@ def _repair_missing_sources(nb: Notebook, store: LanceChunkStore, embedder) -> l
     entirely or whose row count doesn't match its manifest `chunk_count` --
     e.g. rows deleted or lost outside of a normal ingest run, or a run that
     crashed after `store.delete_source` but before `store.upsert`.
+
+    If a source's processed chunks can't actually restore it -- the
+    `.chunks.jsonl` is missing/empty while the manifest expects chunks, it's
+    corrupt, or embedding/writing it back fails for any other reason -- that
+    source is *not* reported as repaired. Instead its manifest entry is
+    dropped, so the `ingest_notebook` call that follows this one re-parses it
+    from its source file in the same run (fixing it a different way) rather
+    than the run aborting or silently leaving it broken. Each source is
+    repaired independently, so one bad source never affects the others.
     """
     from notecast.ingest import manifest as manifest_mod
 
@@ -75,16 +87,34 @@ def _repair_missing_sources(nb: Notebook, store: LanceChunkStore, embedder) -> l
         counts[chunk.source_path] = counts.get(chunk.source_path, 0) + 1
 
     repaired: list[str] = []
-    for source_path, entry in m.entries.items():
+    manifest_changed = False
+    for source_path, entry in list(m.entries.items()):
         if counts.get(source_path, 0) == entry.chunk_count:
             continue
-        chunks = load_source_chunks(nb, source_path)
-        store.delete_source(source_path)
-        if chunks:
-            vectors = _embed_chunks(embedder, chunks)
-            store.upsert(chunks, vectors)
-        repaired.append(source_path)
+        try:
+            chunks = load_source_chunks(nb, source_path)
+            if not chunks and entry.chunk_count > 0:
+                raise ValueError(
+                    f"processed chunks for {source_path!r} are missing or empty, "
+                    f"but the manifest expects {entry.chunk_count}"
+                )
+            store.delete_source(source_path)
+            if chunks:
+                vectors = _embed_chunks(embedder, chunks)
+                store.upsert(chunks, vectors)
+            repaired.append(source_path)
+        except Exception as exc:  # noqa: BLE001 -- one bad source must not abort the repair pass
+            logger.warning(
+                "Could not repair %r from its processed chunks (%s); dropping its "
+                "manifest entry so it's re-parsed from source this run.",
+                source_path,
+                exc,
+            )
+            m.entries.pop(source_path, None)
+            manifest_changed = True
 
+    if manifest_changed:
+        manifest_mod.save_manifest(nb, m)
     if repaired:
         store.rebuild_text_index()
     return repaired

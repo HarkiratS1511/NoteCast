@@ -265,6 +265,32 @@ def test_load_source_chunks_reads_one_source(tmp_notebooks_root: Path) -> None:
     assert pipeline.load_source_chunks(nb, "missing.txt") == []
 
 
+def test_atomic_write_leaves_no_partial_file_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "out.txt"
+    target.write_text("original", encoding="utf-8")
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(pipeline.os, "replace", _boom)
+
+    with pytest.raises(OSError):
+        pipeline._atomic_write_text(target, "new content")
+
+    # The original file is untouched, and no temp file was left behind.
+    assert target.read_text(encoding="utf-8") == "original"
+    assert list(tmp_path.iterdir()) == [target]
+
+
+def test_atomic_write_creates_new_file(tmp_path: Path) -> None:
+    target = tmp_path / "sub" / "out.txt"
+    pipeline._atomic_write_text(target, "hello")
+    assert target.read_text(encoding="utf-8") == "hello"
+    assert list(target.parent.iterdir()) == [target]
+
+
 def test_manifest_survives_crash_after_each_file(tmp_notebooks_root: Path) -> None:
     nb = Notebook.create("my-course", root=tmp_notebooks_root)
     (nb.sources_dir / "notes.txt").write_text("hello world")
