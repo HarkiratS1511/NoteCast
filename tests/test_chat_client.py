@@ -9,11 +9,13 @@ import pytest
 from notecast.chat.client import (
     ChatError,
     MissingApiKeyError,
+    ProviderConfigError,
     _cached_client,
     get_client,
     map_anthropic_error,
 )
 from notecast.config import Settings, get_settings
+from notecast.providers.openai_compat import OpenAICompatClient
 
 
 @pytest.fixture(autouse=True)
@@ -93,3 +95,79 @@ def test_map_not_found_error() -> None:
 def test_map_unknown_error_still_returns_chat_error() -> None:
     mapped = map_anthropic_error(ValueError("something else"))
     assert isinstance(mapped, ChatError)
+
+
+# --- get_client dispatch on provider ----------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_agentaus_client_cache():
+    from notecast.chat import client as client_module
+
+    client_module._agentaus_clients.clear()
+    yield
+    client_module._agentaus_clients.clear()
+
+
+def _agentaus_settings(**overrides) -> Settings:
+    defaults = dict(
+        _env_file=None,
+        provider="agentaus",
+        agentaus_api_key="test-key",
+        agentaus_base_url="https://agentaus.example.com/v1",
+        agentaus_model="agentaus-model",
+        notebooks_dir="notebooks",
+    )
+    defaults.update(overrides)
+    get_settings.cache_clear()
+    return Settings(**defaults)
+
+
+def test_get_client_dispatches_to_anthropic_by_default() -> None:
+    settings = _make_settings("sk-ant-test-key")
+    client = get_client(settings)
+    assert isinstance(client, anthropic.Anthropic)
+
+
+def test_get_client_dispatches_to_openai_compat_for_agentaus() -> None:
+    settings = _agentaus_settings()
+    client = get_client(settings)
+    assert isinstance(client, OpenAICompatClient)
+
+
+def test_get_client_agentaus_is_cached() -> None:
+    settings = _agentaus_settings()
+    client1 = get_client(settings)
+    client2 = get_client(settings)
+    assert client1 is client2
+
+
+def test_get_client_agentaus_missing_api_key_raises_missing_api_key_error() -> None:
+    settings = _agentaus_settings(agentaus_api_key=None)
+    with pytest.raises(MissingApiKeyError) as exc_info:
+        get_client(settings)
+    assert "AGENTAUS_API_KEY" in str(exc_info.value)
+
+
+def test_get_client_agentaus_missing_base_url_raises_provider_config_error() -> None:
+    settings = _agentaus_settings(agentaus_base_url=None)
+    with pytest.raises(ProviderConfigError) as exc_info:
+        get_client(settings)
+    message = str(exc_info.value)
+    assert "AGENTAUS_BASE_URL" in message
+    assert "docs/AGENTAUS.md" in message
+
+
+def test_get_client_agentaus_missing_model_raises_provider_config_error() -> None:
+    settings = _agentaus_settings(agentaus_model=None)
+    with pytest.raises(ProviderConfigError) as exc_info:
+        get_client(settings)
+    assert "NOTECAST_AGENTAUS_MODEL" in str(exc_info.value)
+
+
+def test_missing_api_key_error_default_message_unchanged() -> None:
+    # Existing callers (CLI, other tests) rely on the zero-arg message
+    # mentioning ANTHROPIC_API_KEY.
+    message = str(MissingApiKeyError())
+    assert "ANTHROPIC_API_KEY" in message
+    assert "console.anthropic.com" in message
