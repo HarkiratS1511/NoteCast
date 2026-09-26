@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from notecast.audio.models import AudioScope, RankedKeyPoint
 from notecast.audio.planner import budget_minutes, plan_audio
 from notecast.config import Settings
@@ -14,28 +16,39 @@ def make_ranked_point(
     tier: str = "A",
     importance: int = 4,
     chunk_id: str | None = None,
+    chunk_ids: list[str] | None = None,
 ) -> RankedKeyPoint:
+    ids = chunk_ids if chunk_ids is not None else ([chunk_id] if chunk_id else [])
     return RankedKeyPoint(
         id=f"kp-{idx}",
         title=f"Point {idx}",
         summary="summary",
         importance=importance,
-        source_chunk_ids=[chunk_id] if chunk_id else [],
+        source_chunk_ids=ids,
         tier=tier,
         rank=idx,
     )
 
 
-def make_chunk(course: str, source_path: str, ordinal: int, *, week: int | None = 1) -> Chunk:
+def make_chunk(
+    course: str,
+    source_path: str,
+    ordinal: int,
+    *,
+    week: int | None = 1,
+    slide: int | None = None,
+    t_start: float | None = None,
+    source_type: str = "pdf",
+) -> Chunk:
     text = f"text-{source_path}-{ordinal}"
     return Chunk(
         chunk_id=Chunk.make_id(course, source_path, ordinal, text),
         course=course,
         source_path=source_path,
-        source_type="pdf",
+        source_type=source_type,
         ordinal=ordinal,
         text=text,
-        location=Location(),
+        location=Location(slide=slide, t_start=t_start),
         week=week,
     )
 
@@ -170,3 +183,51 @@ def test_plan_audio_keeps_all_tier_a_points() -> None:
 
     all_point_ids = {pid for chapter in plan.chapters for pid in chapter.point_ids}
     assert all_point_ids == {f"kp-{i}" for i in range(15)}
+
+
+def test_plan_audio_raises_on_no_points() -> None:
+    with pytest.raises(ValueError, match="No key points to plan"):
+        plan_audio([], AudioScope(), settings_with(), [])
+
+
+def test_plan_audio_orders_slides_before_transcript_within_same_week() -> None:
+    course = "comp4650"
+    # Same week: a transcript chunk that comes "first" alphabetically/by
+    # ordinal should still sort AFTER the slide chunk, because slides define
+    # the lecture's structure.
+    transcript_chunk = make_chunk(course, "week3.vtt", 0, week=3, t_start=5.0, source_type="vtt")
+    slide_chunk = make_chunk(course, "week3-slides.pdf", 10, week=3, slide=1)
+
+    points = [
+        make_ranked_point(1, tier="A", chunk_id=transcript_chunk.chunk_id),
+        make_ranked_point(2, tier="A", chunk_id=slide_chunk.chunk_id),
+    ]
+    plan = plan_audio(points, AudioScope(), settings_with(), [transcript_chunk, slide_chunk])
+
+    ordered_ids = [pid for chapter in plan.chapters for pid in chapter.point_ids]
+    assert ordered_ids == ["kp-2", "kp-1"]  # slide point before transcript point
+
+
+def test_plan_audio_uses_earliest_slide_chunk_for_a_point_in_both() -> None:
+    course = "comp4650"
+    early_slide = make_chunk(course, "week1-slides.pdf", 0, week=1, slide=1)
+    late_slide = make_chunk(course, "week1-slides.pdf", 5, week=1, slide=6)
+    transcript_chunk = make_chunk(course, "week1.vtt", 0, week=1, t_start=1.0, source_type="vtt")
+    other_point_chunk = late_slide
+
+    # Point 1 appears in both a late slide and the transcript, but also in
+    # the *early* slide -- ordering should use the earliest slide chunk.
+    points = [
+        make_ranked_point(
+            1,
+            tier="A",
+            chunk_ids=[late_slide.chunk_id, transcript_chunk.chunk_id, early_slide.chunk_id],
+        ),
+        make_ranked_point(2, tier="A", chunk_id=other_point_chunk.chunk_id),
+    ]
+    chunks = [early_slide, late_slide, transcript_chunk]
+    plan = plan_audio(points, AudioScope(), settings_with(), chunks)
+
+    ordered_ids = [pid for chapter in plan.chapters for pid in chapter.point_ids]
+    # kp-1's earliest slide (ordinal 0) sorts before kp-2's only chunk (ordinal 5).
+    assert ordered_ids == ["kp-1", "kp-2"]

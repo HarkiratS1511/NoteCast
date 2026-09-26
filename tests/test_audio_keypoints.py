@@ -9,13 +9,18 @@ from typing import Any
 import pytest
 
 from notecast.audio.keypoints import (
+    EXTRACTION_MAX_TOKENS,
+    MERGE_MAX_TOKENS,
+    STREAMING_THRESHOLD,
     KeyPointRun,
+    _MergeResult,
     extract_key_points,
     group_by_source,
     merge_and_rank,
     select_chunks,
 )
 from notecast.audio.models import AudioScope, KeyPoint
+from notecast.chat.client import ChatError
 from notecast.config import Settings
 from notecast.models import Chunk, Location, SourceType
 
@@ -83,24 +88,48 @@ class FakeTextBlock:
 class FakeCreateResponse:
     content: list[FakeTextBlock]
     usage: FakeUsage = field(default_factory=FakeUsage)
+    stop_reason: str = "end_turn"
 
 
 @dataclass
 class FakeParseResponse:
     parsed_output: Any
     usage: FakeUsage = field(default_factory=FakeUsage)
+    stop_reason: str = "end_turn"
+    content: list[FakeTextBlock] = field(default_factory=list)
+
+
+class FakeStreamContext:
+    """Mimics `with client.messages.stream(...) as stream: stream.get_final_message()`."""
+
+    def __init__(self, response: Any) -> None:
+        self._response = response
+
+    def __enter__(self) -> FakeStreamContext:
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        return None
+
+    def get_final_message(self) -> Any:
+        return self._response
 
 
 class FakeMessages:
-    """Scripted `.create` / `.parse` responses, in call order."""
+    """Scripted `.create` / `.parse` / `.stream` responses, in call order."""
 
     def __init__(
-        self, create_responses: list[Any] | None = None, parse_responses: list[Any] | None = None
+        self,
+        create_responses: list[Any] | None = None,
+        parse_responses: list[Any] | None = None,
+        stream_responses: list[Any] | None = None,
     ) -> None:
         self.create_responses = list(create_responses or [])
         self.parse_responses = list(parse_responses or [])
+        self.stream_responses = list(stream_responses or [])
         self.create_calls: list[dict[str, Any]] = []
         self.parse_calls: list[dict[str, Any]] = []
+        self.stream_calls: list[dict[str, Any]] = []
 
     def create(self, **kwargs: Any) -> Any:
         self.create_calls.append(kwargs)
@@ -110,12 +139,19 @@ class FakeMessages:
         self.parse_calls.append(kwargs)
         return self.parse_responses.pop(0)
 
+    def stream(self, **kwargs: Any) -> FakeStreamContext:
+        self.stream_calls.append(kwargs)
+        return FakeStreamContext(self.stream_responses.pop(0))
+
 
 class FakeClient:
     def __init__(
-        self, create_responses: list[Any] | None = None, parse_responses: list[Any] | None = None
+        self,
+        create_responses: list[Any] | None = None,
+        parse_responses: list[Any] | None = None,
+        stream_responses: list[Any] | None = None,
     ) -> None:
-        self.messages = FakeMessages(create_responses, parse_responses)
+        self.messages = FakeMessages(create_responses, parse_responses, stream_responses)
 
 
 def extraction_response(points: list[dict[str, Any]]) -> FakeCreateResponse:
@@ -124,8 +160,6 @@ def extraction_response(points: list[dict[str, Any]]) -> FakeCreateResponse:
 
 
 def merge_response(points: list[dict[str, Any]]) -> FakeParseResponse:
-    from notecast.audio.keypoints import _MergeResult
-
     parsed = _MergeResult.model_validate({"ranked_points": points})
     return FakeParseResponse(parsed_output=parsed)
 
@@ -435,3 +469,109 @@ def test_combined_usage_accumulates_across_both_calls(settings: Settings) -> Non
     assert run.calls == 2
     assert run.input_tokens == 1300
     assert run.output_tokens == 300
+
+
+# ---------------------------------------------------------------------------
+# max_tokens headroom, stop_reason handling, id collisions (follow-up fixes)
+# ---------------------------------------------------------------------------
+
+
+def test_extraction_uses_16k_max_tokens(settings: Settings) -> None:
+    chunks = [make_chunk("a.pdf", 0, text="alpha")]
+    client = FakeClient(create_responses=[extraction_response([])])
+
+    extract_key_points("a.pdf", chunks, client=client, settings=settings)
+
+    assert EXTRACTION_MAX_TOKENS == 16_000
+    assert client.messages.create_calls[0]["max_tokens"] == 16_000
+
+
+def test_merge_uses_16k_max_tokens(settings: Settings) -> None:
+    points_by_source = {"a.pdf": [_key_point("Alpha")]}
+    response = merge_response([{"title": "Alpha", "summary": "s", "tier": "A"}])
+    client = FakeClient(parse_responses=[response])
+
+    merge_and_rank(points_by_source, client=client, settings=settings)
+
+    assert MERGE_MAX_TOKENS == 16_000
+    assert client.messages.parse_calls[0]["max_tokens"] == 16_000
+
+
+def test_extraction_retries_once_with_doubled_max_tokens_on_max_tokens_stop(
+    settings: Settings,
+) -> None:
+    chunks = [make_chunk("a.pdf", 0, text="alpha")]
+    truncated = FakeCreateResponse(content=[FakeTextBlock(text="")], stop_reason="max_tokens")
+    good = extraction_response(
+        [{"title": "T", "summary": "S", "source_chunk_ids": [chunks[0].chunk_id]}]
+    )
+    # Doubled max_tokens (32000) exceeds STREAMING_THRESHOLD, so the retry goes via .stream().
+    client = FakeClient(create_responses=[truncated], stream_responses=[good])
+
+    points = extract_key_points("a.pdf", chunks, client=client, settings=settings)
+
+    assert len(points) == 1
+    [create_call] = client.messages.create_calls
+    assert create_call["max_tokens"] == EXTRACTION_MAX_TOKENS
+    [stream_call] = client.messages.stream_calls
+    assert stream_call["max_tokens"] == EXTRACTION_MAX_TOKENS * 2
+    assert stream_call["max_tokens"] > STREAMING_THRESHOLD
+
+
+def test_extraction_raises_chat_error_on_refusal(settings: Settings) -> None:
+    chunks = [make_chunk("a.pdf", 0, text="alpha")]
+    refusal = FakeCreateResponse(content=[FakeTextBlock(text="")], stop_reason="refusal")
+    client = FakeClient(create_responses=[refusal])
+
+    with pytest.raises(ChatError):
+        extract_key_points("a.pdf", chunks, client=client, settings=settings)
+
+
+def test_merge_retries_once_with_doubled_max_tokens_on_max_tokens_stop(settings: Settings) -> None:
+    points_by_source = {"a.pdf": [_key_point("Alpha", source_chunk_ids=["c1"])]}
+    truncated = FakeParseResponse(parsed_output=None, stop_reason="max_tokens")
+    # anthropic 1.8.0's client.messages.stream(..., output_format=...) populates
+    # parsed_output on the final message the same way .parse() does.
+    good_via_stream = merge_response(
+        [{"title": "Alpha", "summary": "s", "source_chunk_ids": ["c1"], "tier": "A"}]
+    )
+    client = FakeClient(parse_responses=[truncated], stream_responses=[good_via_stream])
+
+    ranked = merge_and_rank(points_by_source, client=client, settings=settings)
+
+    assert len(ranked) == 1
+    assert ranked[0].title == "Alpha"
+    [parse_call] = client.messages.parse_calls
+    assert parse_call["max_tokens"] == MERGE_MAX_TOKENS
+    assert parse_call["output_format"] is _MergeResult
+    [stream_call] = client.messages.stream_calls
+    assert stream_call["max_tokens"] == MERGE_MAX_TOKENS * 2
+    # output_format is passed straight through to .stream(); no hand-built schema.
+    assert stream_call["output_format"] is _MergeResult
+    assert "output_config" not in stream_call or "format" not in stream_call["output_config"]
+
+
+def test_merge_raises_chat_error_on_refusal(settings: Settings) -> None:
+    points_by_source = {"a.pdf": [_key_point("Alpha")]}
+    refusal = FakeParseResponse(parsed_output=None, stop_reason="refusal")
+    client = FakeClient(parse_responses=[refusal])
+
+    with pytest.raises(ChatError):
+        merge_and_rank(points_by_source, client=client, settings=settings)
+
+
+def test_extraction_ids_do_not_collide_across_same_named_sources(settings: Settings) -> None:
+    chunk_a = make_chunk("week-01/slides.pdf", 0, text="alpha")
+    chunk_b = make_chunk("week-02/slides.pdf", 0, text="beta")
+    response_a = extraction_response(
+        [{"title": "A", "summary": "s", "source_chunk_ids": [chunk_a.chunk_id]}]
+    )
+    response_b = extraction_response(
+        [{"title": "B", "summary": "s", "source_chunk_ids": [chunk_b.chunk_id]}]
+    )
+    client = FakeClient(create_responses=[response_a, response_b])
+
+    points_a = extract_key_points("week-01/slides.pdf", [chunk_a], client=client, settings=settings)
+    points_b = extract_key_points("week-02/slides.pdf", [chunk_b], client=client, settings=settings)
+
+    assert points_a[0].id != points_b[0].id

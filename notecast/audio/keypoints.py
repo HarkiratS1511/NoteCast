@@ -35,23 +35,35 @@ while still giving the planner/CLI a way to report spend.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 from typing import Any
 
 import anthropic
 from pydantic import BaseModel, Field, ValidationError
 
 from notecast.audio.models import AudioScope, KeyPoint, KeyPointKind, RankedKeyPoint, Tier
-from notecast.chat.client import map_anthropic_error
+from notecast.chat.client import ChatError, map_anthropic_error
 from notecast.chat.pricing import estimate_cost
 from notecast.config import Settings
 from notecast.ingest.textutils import estimate_tokens
 from notecast.models import Chunk, SourceType
 
+logger = logging.getLogger(__name__)
+
 # Sources whose text is roughly larger than this many tokens are split into
 # parts before extraction, so a single Haiku call never has to swallow an
 # entire textbook chapter in one prompt.
 MAX_SOURCE_TOKENS = 60_000
+
+# Non-streaming requests risk an SDK HTTP timeout above ~16K max_tokens (see
+# the claude-api skill's model-migration notes) -- anything above this uses
+# `client.messages.stream(...).get_final_message()` instead of `.create()`.
+STREAMING_THRESHOLD = 16_000
+# Headroom for a single-source extraction call and for the merge/rank call.
+EXTRACTION_MAX_TOKENS = 16_000
+MERGE_MAX_TOKENS = 16_000
 
 
 class KeyPointRun(BaseModel):
@@ -83,6 +95,115 @@ def _usage_dict(response: Any) -> dict[str, Any]:
         "cache_read_tokens": getattr(usage, "cache_read_input_tokens", 0) or 0,
         "cache_write_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
     }
+
+
+def _invoke(
+    *,
+    client: anthropic.Anthropic,
+    model: str,
+    max_tokens: int,
+    system: str,
+    messages: list[dict[str, Any]],
+    parse_model: type[BaseModel] | None = None,
+    effort: str | None = None,
+) -> Any:
+    """Call Claude, streaming automatically when `max_tokens` exceeds
+    `STREAMING_THRESHOLD`. When `parse_model` is given, `output_format` is
+    passed through to either `messages.parse` (non-streaming) or
+    `messages.stream` (streaming; `anthropic` 1.8.0's `.stream()` accepts
+    `output_format=` directly and populates `parsed_output` on the final
+    message the same way `.parse()` does) -- so the response's
+    `parsed_output` is set either way, with no hand-built JSON schema and
+    no manual JSON parsing needed.
+    """
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": messages,
+    }
+    if parse_model is not None:
+        kwargs["output_format"] = parse_model
+    if effort:
+        kwargs["output_config"] = {"effort": effort}
+
+    if max_tokens > STREAMING_THRESHOLD:
+        with client.messages.stream(**kwargs) as stream:
+            return stream.get_final_message()
+    return (
+        client.messages.create(**kwargs) if parse_model is None else client.messages.parse(**kwargs)
+    )
+
+
+def _response_text(response: Any) -> str | None:
+    content = getattr(response, "content", None) or []
+    return next((b.text for b in content if getattr(b, "type", None) == "text"), None)
+
+
+def _invoke_with_retries(
+    *,
+    client: anthropic.Anthropic,
+    model: str,
+    max_tokens: int,
+    system: str,
+    messages: list[dict[str, Any]],
+    parse_model: type[BaseModel] | None = None,
+    effort: str | None = None,
+    usage: KeyPointRun | None = None,
+) -> Any:
+    """`_invoke`, plus explicit `stop_reason` handling: "refusal" raises a
+    `ChatError` immediately; "max_tokens" logs a warning and retries once
+    with doubled max_tokens (streaming if that now exceeds
+    `STREAMING_THRESHOLD`); anything else is returned as-is. Every call
+    (including the retry) is added to `usage` if given.
+    """
+
+    def call(tokens: int) -> Any:
+        response = _invoke(
+            client=client,
+            model=model,
+            max_tokens=tokens,
+            system=system,
+            messages=messages,
+            parse_model=parse_model,
+            effort=effort,
+        )
+        if usage is not None:
+            usage.add(model, _usage_dict(response))
+        return response
+
+    response = call(max_tokens)
+    stop_reason = getattr(response, "stop_reason", None)
+    if stop_reason == "refusal":
+        logger.error("%s refused the request (stop_reason=refusal)", model)
+        raise ChatError(f"Claude ({model}) refused this request.")
+    if stop_reason == "max_tokens":
+        doubled = max_tokens * 2
+        logger.warning(
+            "%s hit max_tokens=%d (stop_reason=max_tokens); retrying once with max_tokens=%d%s",
+            model,
+            max_tokens,
+            doubled,
+            " (streaming)" if doubled > STREAMING_THRESHOLD else "",
+        )
+        response = call(doubled)
+        retried_stop = getattr(response, "stop_reason", None)
+        if retried_stop == "refusal":
+            logger.error("%s refused the retried request (stop_reason=refusal)", model)
+            raise ChatError(f"Claude ({model}) refused this request.")
+        if retried_stop == "max_tokens":
+            logger.warning(
+                "%s hit max_tokens again at %d after doubling; giving up on this attempt",
+                model,
+                doubled,
+            )
+        else:
+            logger.debug(
+                "%s recovered after doubling max_tokens (stop_reason=%s)", model, retried_stop
+            )
+    else:
+        logger.debug("%s stop_reason=%s", model, stop_reason)
+    return response
 
 
 def select_chunks(chunks: list[Chunk], scope: AudioScope) -> list[Chunk]:
@@ -231,22 +352,24 @@ def _extract_part(
                 }
             )
         try:
-            response = client.messages.create(
+            response = _invoke_with_retries(
+                client=client,
                 model=settings.helper_model,
-                max_tokens=8000,
+                max_tokens=EXTRACTION_MAX_TOKENS,
                 system=_EXTRACTION_SYSTEM,
                 messages=messages,
+                usage=usage,
             )
         except anthropic.AnthropicError as exc:
             raise map_anthropic_error(exc) from exc
-        if usage is not None:
-            usage.add(settings.helper_model, _usage_dict(response))
-        text = next((b.text for b in response.content if b.type == "text"), "")
+        text = _response_text(response) or ""
         try:
             result = _parse_extraction_json(text)
         except (json.JSONDecodeError, ValidationError) as exc:
             last_error = exc
+            logger.warning("extraction JSON validation failed (attempt %d): %s", attempt + 1, exc)
             continue
+        logger.debug("extraction succeeded on attempt %d", attempt + 1)
         for point in result.key_points:
             point.source_chunk_ids = [cid for cid in point.source_chunk_ids if cid in valid_ids]
         return result.key_points
@@ -270,6 +393,10 @@ def extract_key_points(
     chunks_by_id = {c.chunk_id: c for c in chunks}
     parts = _split_into_parts(chunks)
 
+    # Derived from the full source_path (not just the basename) so that
+    # e.g. week-01/slides.pdf and week-02/slides.pdf never collide.
+    source_slug = hashlib.sha1(source_path.encode("utf-8")).hexdigest()[:8]
+
     points: list[KeyPoint] = []
     counter = 0
     for part in parts:
@@ -281,10 +408,9 @@ def extract_key_points(
             source_chunks = [chunks_by_id[cid] for cid in item.source_chunk_ids]
             in_slides = any(_chunk_flags(c)[0] for c in source_chunks)
             in_transcript = any(_chunk_flags(c)[1] for c in source_chunks)
-            slug = source_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
             points.append(
                 KeyPoint(
-                    id=f"kp-{slug}-{counter}",
+                    id=f"kp-{source_slug}-{counter}",
                     title=item.title,
                     summary=item.summary,
                     kind=item.kind,
@@ -407,30 +533,22 @@ def merge_and_rank(
                 }
             )
         try:
-            response = client.messages.parse(
+            response = _invoke_with_retries(
+                client=client,
                 model=settings.script_model,
-                max_tokens=8000,
+                max_tokens=MERGE_MAX_TOKENS,
                 system=_MERGE_SYSTEM,
                 messages=messages,
-                output_format=_MergeResult,
-                output_config={"effort": "medium"},
+                parse_model=_MergeResult,
+                effort="medium",
+                usage=usage,
             )
         except anthropic.AnthropicError as exc:
             raise map_anthropic_error(exc) from exc
-        except TypeError:
-            # Fake/mocked clients in tests may not accept output_config.
-            response = client.messages.parse(
-                model=settings.script_model,
-                max_tokens=8000,
-                system=_MERGE_SYSTEM,
-                messages=messages,
-                output_format=_MergeResult,
-            )
-        if usage is not None:
-            usage.add(settings.script_model, _usage_dict(response))
         parsed = getattr(response, "parsed_output", None)
         if parsed is None:
             last_error = ValueError("no parsed_output on response")
+            logger.warning("merge attempt %d returned no usable output", attempt + 1)
             continue
         try:
             result = (
@@ -459,7 +577,9 @@ def merge_and_rank(
                 )
             )
         if ranked:
+            logger.debug("merge_and_rank succeeded on attempt %d", attempt + 1)
             return ranked
         last_error = ValueError("model returned zero ranked points")
 
+    logger.warning("merge_and_rank falling back to deterministic ranking after: %s", last_error)
     return _fallback_rank(all_points)

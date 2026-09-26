@@ -78,30 +78,49 @@ def _point_weight(point: RankedKeyPoint, include_c: bool) -> float:
     return TIER_C_MINUTES if include_c else 0.0
 
 
-def _chunk_order_key(chunks_by_id: dict[str, Chunk]) -> dict[str, tuple[int, str, int]]:
-    """For every chunk id, a (week, source_path, ordinal) sort key, with an
-    absent week sorted last (a big sentinel), so course order is
-    week -> source_path -> ordinal.
+def _is_slide_chunk(chunk: Chunk) -> bool:
+    """True if this chunk comes from a slide/page source rather than a
+    transcript -- slides define the lecture's structure, so they sort
+    before transcript chunks within the same week.
     """
-    keys: dict[str, tuple[int, str, int]] = {}
+    return chunk.location.slide is not None or chunk.location.page is not None
+
+
+def _chunk_order_key(chunks_by_id: dict[str, Chunk]) -> dict[str, tuple[int, int, str, int]]:
+    """For every chunk id, a (week, kind_rank, source_path, ordinal) sort
+    key, with an absent week sorted last (a big sentinel) and kind_rank 0
+    for slide/page chunks, 1 for transcript chunks -- so course order is
+    week -> slides-before-transcript -> source_path -> ordinal.
+    """
+    keys: dict[str, tuple[int, int, str, int]] = {}
     for chunk_id, chunk in chunks_by_id.items():
         week = chunk.week if chunk.week is not None else 10**9
-        keys[chunk_id] = (week, chunk.source_path, chunk.ordinal)
+        kind_rank = 0 if _is_slide_chunk(chunk) else 1
+        keys[chunk_id] = (week, kind_rank, chunk.source_path, chunk.ordinal)
     return keys
 
 
 def _course_order(points: list[RankedKeyPoint], chunks: list[Chunk]) -> list[RankedKeyPoint]:
     """Order points by course order of first appearance: earliest
-    (week, source_path, ordinal) among a point's own source_chunk_ids.
-    Points with no known chunks sort last, in their given (ranked) order.
+    (week, kind_rank, source_path, ordinal) among a point's own
+    source_chunk_ids, preferring its earliest SLIDE chunk when it has one
+    (a point present in both slides and a transcript is ordered by where
+    it first appears on slides, not where the lecturer happens to mention
+    it). Points with no known chunks sort last, in their given (ranked)
+    order.
     """
     chunks_by_id = {c.chunk_id: c for c in chunks}
     order_keys = _chunk_order_key(chunks_by_id)
-    sentinel = (10**9, "￿", 10**9)
+    sentinel = (10**9, 1, "￿", 10**9)
 
-    def key(point: RankedKeyPoint) -> tuple[tuple[int, str, int], int]:
+    def key(point: RankedKeyPoint) -> tuple[tuple[int, int, str, int], int]:
         candidates = [order_keys[cid] for cid in point.source_chunk_ids if cid in order_keys]
-        best = min(candidates) if candidates else sentinel
+        slide_candidates = [c for c in candidates if c[1] == 0]
+        best = (
+            min(slide_candidates)
+            if slide_candidates
+            else (min(candidates) if candidates else sentinel)
+        )
         return best, point.rank
 
     return sorted(points, key=key)
@@ -171,8 +190,11 @@ def plan_audio(
     """Build the full audio plan: length budget + chapter outline.
 
     `chunks` is used only to look up each point's earliest chunk for course
-    ordering (week, then source_path, then chunk ordinal).
+    ordering (week, then slides-before-transcript, then source_path, then
+    chunk ordinal).
     """
+    if not points:
+        raise ValueError("No key points to plan")
     minutes, notes = budget_minutes(points, settings)
     target_words = round(minutes * settings.audio_words_per_minute)
 
