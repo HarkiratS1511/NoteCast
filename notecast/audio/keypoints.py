@@ -41,7 +41,7 @@ import logging
 from typing import Any
 
 import anthropic
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from notecast.audio.models import AudioScope, KeyPoint, KeyPointKind, RankedKeyPoint, Tier
 from notecast.chat.client import ChatError, map_anthropic_error
@@ -508,6 +508,30 @@ class _CompactGroup(BaseModel):
     tier: Tier = "B"
     title: str | None = None
 
+    @field_validator("ids", mode="before")
+    @classmethod
+    def _coerce_ids_to_str(cls, value: Any) -> Any:
+        """AgentAUS sometimes emits ids as JSON numbers (e.g. `[3, 17]`)
+        instead of strings -- coerce them rather than failing validation.
+        """
+        if isinstance(value, list):
+            return [item if isinstance(item, str) else str(item) for item in value]
+        return value
+
+    @field_validator("tier", mode="before")
+    @classmethod
+    def _normalize_tier(cls, value: Any) -> Any:
+        """Normalize case/whitespace (" a ", "b", "  C" -> "A"/"B"/"C");
+        anything that still isn't a recognised tier falls back to "B" for
+        *this group only* -- never fails the whole response over one bad
+        tier value.
+        """
+        if isinstance(value, str):
+            normalized = value.strip().upper()
+            if normalized in ("A", "B", "C"):
+                return normalized
+        return "B"
+
 
 class _CompactMergeResult(BaseModel):
     groups: list[_CompactGroup]
@@ -597,6 +621,18 @@ def _merge_members(
     }
 
 
+def _normalize_label(raw: str) -> str:
+    """Normalize a model-supplied point id for lookup against our own
+    "p1".."pN" labels: strips whitespace, lowercases, and treats a bare
+    number ("1", " 1 ") as short for "p1" -- so "P1", "p1", "1", " p1 "
+    all resolve to "p1".
+    """
+    normalized = raw.strip().lower()
+    if normalized and not normalized.startswith("p"):
+        normalized = f"p{normalized}"
+    return normalized
+
+
 def _build_ranked_from_groups(
     groups: list[_CompactGroup],
     points_by_label: dict[str, KeyPoint],
@@ -604,18 +640,28 @@ def _build_ranked_from_groups(
     all_chunk_ids: set[str],
 ) -> list[RankedKeyPoint]:
     """Turn the model's compact groups into `RankedKeyPoint`s, in the
-    model's own rank order. Unknown ids are ignored; an id repeated across
-    groups counts only for the first group that used it; any input point
-    the model never mentioned is appended afterwards, ordered/tiered by
-    `_fallback_rank` (so nothing extracted is silently lost).
+    model's own rank order. Ids are normalised before lookup (see
+    `_normalize_label`); one still unknown afterwards is logged and
+    ignored. An id repeated across groups counts only for the first group
+    that used it; any input point the model never mentioned is appended
+    afterwards, ordered/tiered by `_fallback_rank` (so nothing extracted is
+    silently lost).
     """
     used_ids: set[str] = set()
     merged_items: list[dict[str, Any]] = []
     for group in groups:
         members: list[KeyPoint] = []
-        for label in group.ids:
+        for raw_label in group.ids:
+            label = _normalize_label(raw_label)
             point = points_by_label.get(label)
-            if point is None or point.id in used_ids:
+            if point is None:
+                logger.warning(
+                    "compact merge: unknown point id %r (normalized %r) -- ignoring",
+                    raw_label,
+                    label,
+                )
+                continue
+            if point.id in used_ids:
                 continue
             used_ids.add(point.id)
             members.append(point)

@@ -877,3 +877,119 @@ def test_compact_merge_tracks_usage_and_cost() -> None:
     assert run.input_tokens == 2000
     assert run.output_tokens == 500
     assert run.est_cost_usd > 0
+
+
+# ---------------------------------------------------------------------------
+# merge_and_rank -- AgentAUS compact path: tolerant parsing of real-world
+# model slips. These deliberately send RAW dicts as `parsed_output` (never
+# pre-validated through `compact_merge_response`/`_CompactMergeResult`), so
+# `_CompactGroup`'s own field validators are the thing under test.
+# ---------------------------------------------------------------------------
+
+
+def test_compact_merge_tier_case_and_whitespace_normalized() -> None:
+    points_by_source = {
+        "a.pdf": [
+            _key_point("Alpha", id="kp-1", importance=5, source_chunk_ids=["c1"]),
+            _key_point("Beta", id="kp-2", importance=4, source_chunk_ids=["c2"]),
+            _key_point("Gamma", id="kp-3", importance=3, source_chunk_ids=["c3"]),
+        ]
+    }
+    raw = {
+        "groups": [
+            {"ids": ["p1"], "tier": " a "},
+            {"ids": ["p2"], "tier": "b"},
+            {"ids": ["p3"], "tier": "  C"},
+        ]
+    }
+    client = FakeClient(parse_responses=[FakeParseResponse(parsed_output=raw)])
+
+    ranked = merge_and_rank(points_by_source, client=client, settings=_agentaus_settings())
+
+    assert len(client.messages.parse_calls) == 1
+    assert [p.tier for p in ranked] == ["A", "B", "C"]
+
+
+def test_compact_merge_unknown_tier_falls_back_to_b_per_group() -> None:
+    """An unrecognised tier value never fails the whole response -- just
+    that one group falls back to "B".
+    """
+    points_by_source = {
+        "a.pdf": [
+            _key_point("Alpha", id="kp-1", importance=5, source_chunk_ids=["c1"]),
+            _key_point("Beta", id="kp-2", importance=4, source_chunk_ids=["c2"]),
+        ]
+    }
+    raw = {
+        "groups": [
+            {"ids": ["p1"], "tier": "urgent"},
+            {"ids": ["p2"], "tier": 5},
+        ]
+    }
+    client = FakeClient(parse_responses=[FakeParseResponse(parsed_output=raw)])
+
+    ranked = merge_and_rank(points_by_source, client=client, settings=_agentaus_settings())
+
+    assert len(client.messages.parse_calls) == 1
+    assert [p.tier for p in ranked] == ["B", "B"]
+
+
+def test_compact_merge_int_ids_coerced_to_str() -> None:
+    points_by_source = {
+        "a.pdf": [
+            _key_point("Alpha", id="kp-1", importance=5, source_chunk_ids=["c1"]),
+            _key_point("Beta", id="kp-2", importance=4, source_chunk_ids=["c2"]),
+        ]
+    }
+    # ids as JSON numbers, not strings.
+    raw = {"groups": [{"ids": [1, 2], "tier": "A"}]}
+    client = FakeClient(parse_responses=[FakeParseResponse(parsed_output=raw)])
+
+    ranked = merge_and_rank(points_by_source, client=client, settings=_agentaus_settings())
+
+    assert len(ranked) == 1
+    assert ranked[0].source_chunk_ids == ["c1", "c2"]
+
+
+@pytest.mark.parametrize("variant", ["P1", " p1 ", "1", " 1 ", "p1"])
+def test_compact_merge_label_lookup_normalizes_variants(variant: str) -> None:
+    points_by_source = {"a.pdf": [_key_point("Alpha", id="kp-1", source_chunk_ids=["c1"])]}
+    raw = {"groups": [{"ids": [variant], "tier": "A"}]}
+    client = FakeClient(parse_responses=[FakeParseResponse(parsed_output=raw)])
+
+    ranked = merge_and_rank(points_by_source, client=client, settings=_agentaus_settings())
+
+    assert len(ranked) == 1
+    assert ranked[0].title == "Alpha"
+
+
+def test_compact_merge_duplicate_after_normalization_first_wins() -> None:
+    """ "P1", "p1" and "1" all normalize to the same point -- only the first
+    occurrence claims it, later occurrences are silently ignored (not
+    logged as unknown, since they *were* resolved).
+    """
+    points_by_source = {"a.pdf": [_key_point("Alpha", id="kp-1", source_chunk_ids=["c1"])]}
+    raw = {"groups": [{"ids": ["P1", " p1 ", "1"], "tier": "A"}]}
+    client = FakeClient(parse_responses=[FakeParseResponse(parsed_output=raw)])
+
+    ranked = merge_and_rank(points_by_source, client=client, settings=_agentaus_settings())
+
+    assert len(ranked) == 1
+    assert ranked[0].source_chunk_ids == ["c1"]
+
+
+def test_compact_merge_unknown_id_after_normalization_logs_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    points_by_source = {"a.pdf": [_key_point("Alpha", id="kp-1", source_chunk_ids=["c1"])]}
+    raw = {"groups": [{"ids": ["p1", "p99", "  Q7  "], "tier": "A"}]}
+    client = FakeClient(parse_responses=[FakeParseResponse(parsed_output=raw)])
+
+    with caplog.at_level("WARNING", logger="notecast.audio.keypoints"):
+        ranked = merge_and_rank(points_by_source, client=client, settings=_agentaus_settings())
+
+    assert len(ranked) == 1
+    assert ranked[0].title == "Alpha"
+    warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    assert any("p99" in w and "unknown point id" in w for w in warnings)
+    assert any("q7" in w for w in warnings)
