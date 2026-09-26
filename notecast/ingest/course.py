@@ -69,7 +69,11 @@ def _match_week_component(component: str) -> int | None:
 
 def _config_override(source_path: str, mapping: dict[str, int | str]) -> int | str | None:
     for pattern, value in mapping.items():
-        if fnmatch.fnmatch(source_path, pattern) or source_path.startswith(pattern):
+        if source_path == pattern:
+            return value
+        if source_path.startswith(pattern.rstrip("/") + "/"):
+            return value
+        if fnmatch.fnmatch(source_path, pattern):
             return value
     return None
 

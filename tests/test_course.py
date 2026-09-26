@@ -49,6 +49,30 @@ def test_infer_week_no_config_falls_back_to_inference() -> None:
     assert infer_week("week-03/lecture.pdf", config) == 3
 
 
+def test_infer_topic_config_prefix_override_does_not_match_prefix_collision() -> None:
+    # "week-1" must not match "week-10/..." as a prefix.
+    config = CourseConfig(topics={"week-1": "graphs"})
+    assert infer_topic("week-10/lecture.pdf", config) is None
+    assert infer_topic("week-1/lecture.pdf", config) == "graphs"
+    assert infer_topic("week-1", config) == "graphs"
+
+
+def test_infer_topic_config_prefix_override_with_trailing_slash() -> None:
+    config = CourseConfig(topics={"week-1/": "graphs"})
+    assert infer_topic("week-10/lecture.pdf", config) is None
+    assert infer_topic("week-1/lecture.pdf", config) == "graphs"
+
+
+def test_infer_week_config_prefix_override_does_not_match_prefix_collision() -> None:
+    # An override on "week-1" must not match "week-10/..." as a prefix —
+    # but since it also doesn't match exactly, inference falls through to
+    # the normal folder-name detection, which legitimately reads "week-10"
+    # as week 10 (a different mechanism from the override).
+    config = CourseConfig(weeks={"week-1": 1})
+    assert infer_week("week-10/lecture.pdf", config) == 10
+    assert infer_week("week-1/lecture.pdf", config) == 1
+
+
 def test_infer_topic_only_via_config() -> None:
     assert infer_topic("week-03/lecture.pdf") is None
     config = CourseConfig(topics={"week-03/*": "smoothing"})

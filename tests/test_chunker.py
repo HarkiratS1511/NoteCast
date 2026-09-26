@@ -40,18 +40,22 @@ def _paragraph(n_sentences: int, prefix: str = "Sentence") -> str:
 
 
 def test_slide_sections_one_chunk_each_never_merged() -> None:
+    # Long enough (>= 15 tokens) that the tiny-slide folding below doesn't
+    # kick in — this test is about plain, unrelated slides staying separate.
+    slide_one = "Slide one content, covering an overview of the course syllabus in detail."
+    slide_two = "Slide two content, covering the assessment breakdown and due dates in detail."
     doc = _doc(
         [
-            Section(text="Slide one content.", location=Location(slide=1), title="Intro"),
-            Section(text="Slide two content.", location=Location(slide=2), title="Details"),
+            Section(text=slide_one, location=Location(slide=1), title="Intro"),
+            Section(text=slide_two, location=Location(slide=2), title="Details"),
         ]
     )
     chunks = _chunk(doc)
     assert len(chunks) == 2
     assert chunks[0].location.slide == 1
-    assert chunks[0].text == "Slide one content."
+    assert chunks[0].text == slide_one
     assert chunks[1].location.slide == 2
-    assert chunks[1].text == "Slide two content."
+    assert chunks[1].text == slide_two
 
 
 def test_oversized_slide_is_split_but_keeps_same_location() -> None:
@@ -237,8 +241,14 @@ def test_header_no_week_omits_week_part() -> None:
 def test_chunk_ids_are_stable_and_ordinals_sequential() -> None:
     doc = _doc(
         [
-            Section(text="Slide one.", location=Location(slide=1)),
-            Section(text="Slide two.", location=Location(slide=2)),
+            Section(
+                text="Slide one has a very decent amount of content on it for testing purposes.",
+                location=Location(slide=1),
+            ),
+            Section(
+                text="Slide two also has a decent amount of content on it for testing purposes.",
+                location=Location(slide=2),
+            ),
         ]
     )
     chunks_a = _chunk(doc)
@@ -246,6 +256,95 @@ def test_chunk_ids_are_stable_and_ordinals_sequential() -> None:
     assert [c.chunk_id for c in chunks_a] == [c.chunk_id for c in chunks_b]
     assert [c.ordinal for c in chunks_a] == [0, 1]
     assert len({c.chunk_id for c in chunks_a}) == 2
+
+
+# ---------------------------------------------------------------------------
+# Tiny title-only slides (< 15 tokens) get folded into a neighbouring chunk.
+# ---------------------------------------------------------------------------
+
+
+def _real_slide(n: int) -> str:
+    return f"Slide {n} has enough real content on it to not be considered a tiny slide at all."
+
+
+def test_tiny_slide_merges_forward_into_next_slide() -> None:
+    doc = _doc(
+        [
+            Section(text="Overview", location=Location(slide=1), title="Overview"),
+            Section(text=_real_slide(2), location=Location(slide=2), title="Details"),
+        ]
+    )
+    chunks = _chunk(doc)
+    assert len(chunks) == 1
+    assert chunks[0].location.slide == 1
+    assert "Overview" in chunks[0].text
+    assert _real_slide(2) in chunks[0].text
+    assert chunks[0].header.endswith("slides 1–2")
+
+
+def test_tiny_slide_at_end_merges_backward() -> None:
+    doc = _doc(
+        [
+            Section(text=_real_slide(1), location=Location(slide=1), title="Details"),
+            Section(text="Questions?", location=Location(slide=2), title="Questions"),
+        ]
+    )
+    chunks = _chunk(doc)
+    assert len(chunks) == 1
+    assert chunks[0].location.slide == 1
+    assert _real_slide(1) in chunks[0].text
+    assert "Questions?" in chunks[0].text
+    assert chunks[0].header.endswith("slides 1–2")
+
+
+def test_two_consecutive_tiny_slides_merge_into_next_real_slide() -> None:
+    doc = _doc(
+        [
+            Section(text="Overview", location=Location(slide=1)),
+            Section(text="Part Two", location=Location(slide=2)),
+            Section(text=_real_slide(3), location=Location(slide=3)),
+        ]
+    )
+    chunks = _chunk(doc)
+    assert len(chunks) == 1
+    assert chunks[0].location.slide == 1
+    assert chunks[0].header.endswith("slides 1–3")
+    for text in ("Overview", "Part Two", _real_slide(3)):
+        assert text in chunks[0].text
+
+
+def test_tiny_slide_run_is_capped_at_three() -> None:
+    # Four consecutive tiny slides: at most 3 get folded together.
+    doc = _doc(
+        [
+            Section(text="A", location=Location(slide=1)),
+            Section(text="B", location=Location(slide=2)),
+            Section(text="C", location=Location(slide=3)),
+            Section(text="D", location=Location(slide=4)),
+        ]
+    )
+    chunks = _chunk(doc)
+    # Slides 1-3 fold together (cap of 3). Slide 4 is tiny, last, and
+    # nothing is left to merge into — the cap means it does NOT fold
+    # backward into the already-full group of 3, so it stands alone.
+    assert len(chunks) == 2
+    assert chunks[0].location.slide == 1
+    assert chunks[0].header.endswith("slides 1–3")
+    for text in ("A", "B", "C"):
+        assert text in chunks[0].text
+    assert "D" not in chunks[0].text
+
+    assert chunks[1].location.slide == 4
+    assert chunks[1].text == "D"
+    assert chunks[1].header.endswith("slide 4")
+
+
+def test_non_tiny_slides_keep_normal_single_slide_label() -> None:
+    doc = _doc([Section(text=_real_slide(1), location=Location(slide=1))])
+    chunks = _chunk(doc)
+    assert len(chunks) == 1
+    assert chunks[0].header.endswith("slide 1")
+    assert "slides" not in chunks[0].header
 
 
 def test_whitespace_only_sections_skipped_entirely() -> None:

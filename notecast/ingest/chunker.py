@@ -6,12 +6,38 @@ heading sections), each chunk carrying a contextual header for embedding.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 from notecast.ingest.textutils import SPOKEN_WORDS_PER_MINUTE, estimate_tokens
 from notecast.models import Chunk, Location, ParsedDocument, Section
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 _TRANSCRIPT_KINDS = {"speaker_transcript", "timed_transcript"}
+
+# Slides/pages with less text than this (title-only slides, section
+# dividers, "Questions?" slides) get folded into a neighbouring chunk
+# instead of standing alone as their own near-empty, near-duplicate chunk.
+_TINY_SLIDE_TOKENS = 15
+# Never fold more than this many consecutive tiny slides into one chunk.
+_MAX_TINY_SLIDE_RUN = 3
+
+
+@dataclass
+class _RawChunk:
+    """One chunk-to-be, before ids/headers are assigned. `is_slide` and the
+    `*_num` fields track slide/page numbers so tiny slides can be folded
+    into a neighbour and the merged range recorded for the header.
+    """
+
+    text: str
+    location: Location
+    title: str | None
+    is_slide: bool = False
+    start_num: int | None = None
+    end_num: int | None = None
+    # How many original slide/page sections this chunk already represents,
+    # so tiny-slide folding can respect `_MAX_TINY_SLIDE_RUN`.
+    component_count: int = 1
 
 
 def _is_slide_like(section: Section) -> bool:
@@ -182,6 +208,80 @@ def _split_flowing_section(
     return result
 
 
+def _is_tiny_slide(chunk: _RawChunk) -> bool:
+    return estimate_tokens(chunk.text) < _TINY_SLIDE_TOKENS
+
+
+def _combine_slide_chunks(chunks: list[_RawChunk]) -> _RawChunk:
+    first, last = chunks[0], chunks[-1]
+    text = "\n\n".join(c.text for c in chunks if c.text.strip())
+    title = last.title or first.title
+    return _RawChunk(
+        text=text,
+        location=first.location,
+        title=title,
+        is_slide=True,
+        start_num=first.start_num,
+        end_num=last.end_num,
+        component_count=sum(c.component_count for c in chunks),
+    )
+
+
+def _merge_tiny_slide_run(entries: list[_RawChunk]) -> list[_RawChunk]:
+    """Fold tiny slide/page chunks into a neighbour: forward into the next
+    slide (leading and interior tiny slides), or backward into the previous
+    chunk when a tiny slide is the last one in the document. Never folds
+    more than `_MAX_TINY_SLIDE_RUN` consecutive tiny slides together.
+    """
+    n = len(entries)
+    merged: list[_RawChunk] = []
+    i = 0
+    while i < n:
+        entry = entries[i]
+        if _is_tiny_slide(entry) and i < n - 1:
+            group = [entry]
+            j = i
+            while len(group) < _MAX_TINY_SLIDE_RUN and _is_tiny_slide(entries[j]) and j + 1 < n:
+                j += 1
+                group.append(entries[j])
+            merged.append(_combine_slide_chunks(group))
+            i = j + 1
+        elif _is_tiny_slide(entry) and i == n - 1:
+            # Last slide in the document and tiny: nothing to merge forward
+            # into, so fold it backward into the previous chunk instead —
+            # unless that would push the run past the cap, in which case it
+            # stands alone rather than joining an already-full group.
+            if merged and merged[-1].component_count < _MAX_TINY_SLIDE_RUN:
+                merged[-1] = _combine_slide_chunks([merged[-1], entry])
+            else:
+                merged.append(entry)
+            i += 1
+        else:
+            merged.append(entry)
+            i += 1
+    return merged
+
+
+def _apply_tiny_slide_merging(raw: list[_RawChunk]) -> list[_RawChunk]:
+    """Run tiny-slide folding over each contiguous run of slide/page
+    chunks, leaving any flowing chunks between them untouched.
+    """
+    result: list[_RawChunk] = []
+    n = len(raw)
+    i = 0
+    while i < n:
+        if raw[i].is_slide:
+            j = i
+            while j < n and raw[j].is_slide:
+                j += 1
+            result.extend(_merge_tiny_slide_run(raw[i:j]))
+            i = j
+        else:
+            result.append(raw[i])
+            i += 1
+    return result
+
+
 def _build_header(
     *,
     course_name: str,
@@ -189,6 +289,7 @@ def _build_header(
     doc: ParsedDocument,
     section_title: str | None,
     location: Location,
+    location_label: str | None = None,
 ) -> str:
     parts: list[str] = []
     if course_name:
@@ -201,7 +302,7 @@ def _build_header(
         parts.append(section_title)
     if doc.metadata.get("kind") in _TRANSCRIPT_KINDS:
         parts.append("Lecture transcript")
-    label = location.label()
+    label = location_label if location_label is not None else location.label()
     if label:
         parts.append(label)
     return " · ".join(p for p in parts if p)
@@ -219,7 +320,7 @@ def chunk_document(
     overlap_ratio: float = 0.15,
 ) -> list[Chunk]:
     """Turn a parsed document's sections into retrievable chunks."""
-    raw: list[tuple[str, Location, str | None]] = []
+    raw: list[_RawChunk] = []
     buffer: list[Section] = []
 
     def flush_buffer() -> None:
@@ -227,7 +328,7 @@ def chunk_document(
             return
         text, loc, title = _merge_flowing(buffer)
         if text.strip():
-            raw.append((text, loc, title))
+            raw.append(_RawChunk(text=text, location=loc, title=title))
         buffer.clear()
 
     for section in doc.sections:
@@ -237,13 +338,34 @@ def chunk_document(
 
         if _is_slide_like(section):
             flush_buffer()
+            slide_num = section.location.slide
+            page_num = section.location.page
+            num = slide_num if slide_num is not None else page_num
             if estimate_tokens(text) <= max_tokens:
-                raw.append((text, section.location, section.title))
+                raw.append(
+                    _RawChunk(
+                        text=text,
+                        location=section.location,
+                        title=section.title,
+                        is_slide=True,
+                        start_num=num,
+                        end_num=num,
+                    )
+                )
             else:
                 for part in _split_to_max(text, max_tokens):
                     part = part.strip()
                     if part:
-                        raw.append((part, section.location, section.title))
+                        raw.append(
+                            _RawChunk(
+                                text=part,
+                                location=section.location,
+                                title=section.title,
+                                is_slide=True,
+                                start_num=num,
+                                end_num=num,
+                            )
+                        )
             continue
 
         tokens = estimate_tokens(text)
@@ -254,7 +376,9 @@ def chunk_document(
             ):
                 window_text = window_text.strip()
                 if window_text:
-                    raw.append((window_text, window_loc, section.title))
+                    raw.append(
+                        _RawChunk(text=window_text, location=window_loc, title=section.title)
+                    )
             continue
 
         if buffer:
@@ -268,15 +392,31 @@ def chunk_document(
 
     flush_buffer()
 
+    raw = _apply_tiny_slide_merging(raw)
+
     chunks: list[Chunk] = []
     ordinal = 0
-    for text, loc, title in raw:
-        if not text.strip():
+    for item in raw:
+        if not item.text.strip():
             continue
+        location_label: str | None = None
+        if (
+            item.is_slide
+            and item.start_num is not None
+            and item.end_num is not None
+            and item.start_num != item.end_num
+        ):
+            unit = "pages" if item.location.page is not None else "slides"
+            location_label = f"{unit} {item.start_num}–{item.end_num}"
         header = _build_header(
-            course_name=course_name, week=week, doc=doc, section_title=title, location=loc
+            course_name=course_name,
+            week=week,
+            doc=doc,
+            section_title=item.title,
+            location=item.location,
+            location_label=location_label,
         )
-        chunk_id = Chunk.make_id(course, doc.source_path, ordinal, text)
+        chunk_id = Chunk.make_id(course, doc.source_path, ordinal, item.text)
         chunks.append(
             Chunk(
                 chunk_id=chunk_id,
@@ -284,9 +424,9 @@ def chunk_document(
                 source_path=doc.source_path,
                 source_type=doc.source_type,
                 ordinal=ordinal,
-                text=text,
+                text=item.text,
                 header=header,
-                location=loc,
+                location=item.location,
                 week=week,
                 topic=topic,
             )
