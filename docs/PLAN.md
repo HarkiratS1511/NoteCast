@@ -8,10 +8,10 @@ This builds on the original plan (per-course notebooks → ingest → embed → 
 |---|---|
 | Interface | **Streamlit local web UI** on top of a Python core with a thin CLI for ingest/scripting. The core is UI-agnostic, so a React front end can be added later. |
 | Sources | **PDF, PPTX, DOCX, VTT/SRT/TXT/MD.** Whisper transcription and OCR are dropped from scope (they can go back into Phase 8 later). |
-| Hardware | **Windows/Linux + NVIDIA GPU.** Embeddings, reranker and Kokoro run on CUDA when available and fall back to CPU. `ffmpeg` is a documented prerequisite. |
+| Hardware | **Windows/Linux, CPU by default.** [changed] Embeddings and reranking run via `fastembed` (ONNX runtime) on CPU — no PyTorch/CUDA install needed, and it's fast enough: ~13 passages/sec on a laptop-class CPU, so a whole course (~60–80k tokens) indexes in ~15–20 s. GPU is optional later, if a bigger local model is ever worth it. TTS (Phase 6, see §5) is planned around the same CPU-first, no-PyTorch approach. `ffmpeg` is a documented prerequisite for audio only. |
 | API budget | **Cheapest.** Chat defaults to Sonnet 5, and query rewriting and other helper calls use Haiku 4.5. Audio scripts use Sonnet 5 too. Opus isn't used by default and is a config switch. Deep mode is opt-in and shows an estimated token cost before sending. Prompt caching is on wherever the prefix repeats. |
 | OS / experience | **Windows, fresh setup, learning as we go.** Phase 0 ships `docs/SETUP-WINDOWS.md` (step-by-step installs for uv, Python, ffmpeg, CUDA PyTorch) and `docs/LEARN.md`, a plain-English explainer that grows each phase (what embeddings are, why hybrid search, how citations work). Paths use `pathlib` everywhere and nothing assumes a Unix shell. |
-| Course material | **Never in git; the repo is public and the material is copyrighted.** Material lives in `notebooks/<course>/sources/` (git-ignored). Tests use small synthetic fixtures written for this repo. The real-material eval set lives next to the material (`notebooks/<course>/eval.yaml`), also git-ignored. |
+| Course material | **Never in git; the repo is public and the material is copyrighted.** Material lives in `notebooks/<course>/sources/` (git-ignored). Tests use small synthetic fixtures written for this repo. The real-material eval set lives next to the material, at `notebooks/<course>/eval.yaml`, also git-ignored. |
 | Audio | **Two hosts. Length adapts to the material, up to 45 min. Must cover the important points** from both slides and transcripts (see §5). |
 | Branching | Work directly on `main`. |
 
@@ -57,8 +57,9 @@ notebooks/<course-slug>/
 ## 3. Retrieval [changed]
 
 - **LanceDB over Chroma.** LanceDB has built-in full-text search, which makes **hybrid search** (vector + BM25-style keyword) easy. Lecture material is full of exact terms, acronyms, formula names, and code identifiers that pure embeddings miss.
-- **Embeddings: `BAAI/bge-small-en-v1.5` instead of `all-MiniLM-L6-v2`.** It's similarly small and fast on CPU and clearly better at retrieval. MiniLM truncates at 256 word-pieces, which silently cuts longer chunks. The embedder is behind an interface, so Voyage or a larger local model is a config change.
-- **Optional reranker** (`bge-reranker-base`, local) over the top ~30 hybrid hits → top 8–12 sent to Claude. Toggle it on if eval shows it helps.
+- **Embeddings: `BAAI/bge-small-en-v1.5` instead of `all-MiniLM-L6-v2`, run locally via `fastembed` (ONNX runtime).** [changed] It's similarly small and fast on CPU and clearly better at retrieval — MiniLM truncates at 256 word-pieces, which silently cuts longer chunks. Running it through `fastembed` instead of PyTorch means no CUDA install is required on a fresh Windows machine. The embedder is behind an interface, so Voyage or a larger local model is a config change.
+- **Hybrid (vector + keyword, combined with RRF) is the default retrieval mode.** [decided] The first real eval run against the COMP4650 course (28 answerable test questions) backs this: hybrid hit@1/3/10 = 0.57/0.89/0.93, MRR 0.71 — matching or beating vector-only (0.61/0.82/0.89, MRR 0.71) and keyword-only (0.57/0.79/0.93, MRR 0.70) on the metric that matters most for chat (hit@3), while staying close to the best of either alone everywhere else. See `docs/LEARN.md` Phase 2 for the full write-up including what the early "misses" turned out to be (a labelling bug in the eval harness, not retrieval).
+- **Optional reranker** (`bge-reranker-base` via `fastembed`, local) over the top ~30 hybrid hits → top 8–12 sent to Claude. **Off by default** — wired up and ready, but the hybrid numbers above are already strong enough that it isn't needed yet. Revisit if a future eval set shows it helps.
 - **Filters:** "only week 3", "only the tutorials", "only this file".
 
 ## 4. Grounded chat
@@ -84,7 +85,7 @@ Top-k retrieval is the wrong tool for summaries, because an overview needs **cov
 4. **Adaptive length:** budget ≈ 90 s per Tier A point + 30 s per Tier B + 1 min intro/outro, **clamped to 5–45 min** (≈150 spoken words/min). If the full budget exceeds 45 min, B points are compressed first, and A points are never dropped. The user can override the length.
 5. **Outline into chapters,** then **script chapter by chapter** (Sonnet 5), each call given the full scope material plus the running summary so the hosts stay consistent. Output is structured JSON `[{speaker, text, sources}]`. Two hosts: one explains, one asks the questions a student would ask, including likely confusions.
 6. **Coverage check (Haiku 4.5):** verify every Tier A point is actually explained in the script, then regenerate the chapter for any that are missed. Produce a coverage report.
-7. **TTS:** Kokoro (CUDA), two distinct voices, per-line synthesis, stitched with `pydub` (+ `ffmpeg`) with natural pauses → MP3 plus a transcript with chapter markers and source links.
+7. **TTS:** Kokoro, via **`kokoro-onnx`** (ONNX runtime) rather than the PyTorch Kokoro package. [planned, to validate in Phase 6] Same reasoning as the embedder: no CUDA/PyTorch install needed on a fresh Windows machine. Two distinct voices, per-line synthesis, stitched with `pydub` (+ `ffmpeg`) with natural pauses → MP3 plus a transcript with chapter markers and source links.
 
 ## 6. [new] Evaluation (small but essential)
 
@@ -108,16 +109,16 @@ This is how we'll know if hybrid search, the reranker, or chunk size changes act
 
 Parallel tracks are in brackets; they run as simultaneous Sonnet builders.
 
-| Phase | Deliverable | Parallel tracks |
-|---|---|---|
-| **0. Scaffold** | `pyproject` (uv), ruff, pytest, config, `.env.example`, core data models (`Chunk`, `Source`, `Notebook`), and interfaces for parser/embedder/store | [scaffold+core] [Windows setup + LEARN docs] |
-| **1. Ingestion** | all parsers + chunker + manifest/incremental ingest | [PDF] [PPTX+DOCX] [VTT/SRT/TXT] [chunker+manifest] |
-| **2. Index + retrieval** | embedder, LanceDB store, hybrid search, filters | [embedder] [store+hybrid] [eval harness] |
-| **3. Grounded chat** | Claude client with citations, sources-only mode, citation → location mapping, CLI chat | [claude client+prompts] [citation mapper] [CLI] |
-| **4. Modes** | open mode + web search, Deep (full-context + caching) mode | [web search] [deep mode] |
-| **5. Multi-notebook** | create/list/switch/delete courses, scope filters | single builder |
-| **6. Audio overview** | key points → rank → adaptive outline → chapter scripts → coverage check → Kokoro TTS → stitch | [key points+ranking] [script+coverage] [TTS+stitch] |
-| **7. UI** | chosen front end | depends on choice |
-| **8. Extras** | quiz/flashcards/study guide; later maybe Whisper transcription and OCR | parallel per feature |
+| Phase | Deliverable | Parallel tracks | Status |
+|---|---|---|---|
+| **0. Scaffold** | `pyproject` (uv), ruff, pytest, config, `.env.example`, core data models (`Chunk`, `Source`, `Notebook`), and interfaces for parser/embedder/store | [scaffold+core] [Windows setup + LEARN docs] | Done |
+| **1. Ingestion** | all parsers + chunker + manifest/incremental ingest | [PDF] [PPTX+DOCX] [VTT/SRT/TXT] [chunker+manifest] | Done |
+| **2. Index + retrieval** | embedder, LanceDB store, hybrid search, filters | [embedder] [store+hybrid] [eval harness] | In progress |
+| **3. Grounded chat** | Claude client with citations, sources-only mode, citation → location mapping, CLI chat | [claude client+prompts] [citation mapper] [CLI] | Not started |
+| **4. Modes** | open mode + web search, Deep (full-context + caching) mode | [web search] [deep mode] | Not started |
+| **5. Multi-notebook** | create/list/switch/delete courses, scope filters | single builder | Not started |
+| **6. Audio overview** | key points → rank → adaptive outline → chapter scripts → coverage check → Kokoro TTS → stitch | [key points+ranking] [script+coverage] [TTS+stitch] | Not started |
+| **7. UI** | chosen front end | depends on choice | Not started |
+| **8. Extras** | quiz/flashcards/study guide; later maybe Whisper transcription and OCR | parallel per feature | Not started |
 
 Phase 1 must be solid before anything else, same as the original plan.

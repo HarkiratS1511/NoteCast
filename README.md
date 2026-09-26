@@ -10,7 +10,7 @@ Drop your lectures, workshops, tutorials, slides, and transcripts into a per-cou
 
 There's no chat attachment limit because your material lives in a local index. Claude only sees the passages relevant to each question, or a whole week's content when that's what the task needs.
 
-> **Status:** Phase 0 (scaffold). See [`docs/PLAN.md`](docs/PLAN.md) for the architecture, build phases, and open decisions.
+> **Status:** Phase 2 (search) in progress — ingest works; see [`docs/LEARN.md`](docs/LEARN.md). See [`docs/PLAN.md`](docs/PLAN.md) for the architecture, build phases, and open decisions.
 
 ## How it works (short version)
 
@@ -33,9 +33,9 @@ Audio overviews use the same grounding, then script ► Kokoro TTS (two voices) 
 | Language | Python 3.11+, managed with `uv` |
 | Parsing | `pymupdf` (PDF), `python-pptx`, `python-docx`, `webvtt-py` / `srt` |
 | Vector store | LanceDB (embedded, built-in full-text search for hybrid retrieval) |
-| Embeddings | Local `BAAI/bge-small-en-v1.5` by default, swappable (Voyage optional) |
+| Embeddings | `fastembed` (ONNX) running `BAAI/bge-small-en-v1.5` locally — no GPU/PyTorch needed |
 | LLM | Claude API via the official `anthropic` SDK, with native citations, prompt caching, and web search |
-| TTS | Kokoro (default), Piper (fallback); `pydub` + `ffmpeg` for stitching |
+| TTS | Kokoro via `kokoro-onnx` (planned) |
 | UI | Streamlit (local web UI) + thin CLI |
 
 ## Layout (planned)

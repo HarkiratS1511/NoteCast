@@ -159,23 +159,29 @@ uv run notecast notebooks list
 
 should show `comp4650-document-analysis` in the list.
 
-## 7. (Phase 2 onward) Check your NVIDIA GPU
+## 7. Run ingest to parse and index your files
 
-Later phases (local embeddings, then text-to-speech) run much faster on an
-NVIDIA GPU. You don't need to do anything with this yet — just confirm Windows
-can see your GPU and its driver:
+**NVIDIA/CUDA is not required.** Local search (embeddings) runs on the CPU
+through an ONNX runtime, which is fast enough on a normal laptop — no GPU
+driver or PyTorch install needed.
+
+Once you've added files to a notebook's `sources/` folder (step 6), run:
 
 ```powershell
-nvidia-smi
+uv run notecast ingest comp4650-document-analysis
 ```
 
-**Check it worked:** it prints a table with your GPU's name, driver version,
-and memory. If the command isn't found, install the latest driver from
-[nvidia.com/drivers](https://www.nvidia.com/drivers) first.
+This reads your files (parses PDFs/slides/transcripts into text and splits
+them into small searchable pieces) and indexes them, so later questions can
+find the relevant piece instead of re-reading everything.
 
-The exact command to install a CUDA-enabled build of PyTorch (the library
-that runs the embedding model on your GPU) will be added here in **Phase 2**,
-once we know the versions we need — don't install it yet.
+**First run downloads a search model (~70 MB, once)** into `.cache/models`
+inside the project folder, so it needs internet access the first time only
+— after that it's read from disk. Run `notecast` commands from the project
+folder (`NoteCast/`) so it finds that cache.
+
+**Check it worked:** the command prints a summary of files parsed/chunked,
+with no errors.
 
 ## 8. (Phase 6 onward) Install ffmpeg
 
