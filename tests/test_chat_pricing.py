@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from notecast.chat.pricing import (
     CACHE_READ_MULTIPLIER,
     CACHE_WRITE_MULTIPLIER,
@@ -38,6 +40,19 @@ def test_web_search_cost() -> None:
 
 def test_missing_usage_fields_default_to_zero() -> None:
     assert estimate_cost("claude-sonnet-5", {}) == 0.0
+
+
+def test_opus_5_5_has_lower_cache_read_multiplier() -> None:
+    prices = PRICES_PER_MTOK["claude-opus-5-5"]
+    cost = estimate_cost("claude-opus-5-5", {"cache_read_tokens": 1_000_000})
+    assert cost == pytest.approx(prices["input"] * 0.05)
+    assert cost == pytest.approx(0.20)
+
+
+def test_other_models_keep_default_cache_read_multiplier() -> None:
+    prices = PRICES_PER_MTOK["claude-opus-5"]
+    cost = estimate_cost("claude-opus-5", {"cache_read_tokens": 1_000_000})
+    assert cost == pytest.approx(prices["input"] * CACHE_READ_MULTIPLIER)
 
 
 def test_haiku_and_opus_prices_present() -> None:

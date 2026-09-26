@@ -59,6 +59,9 @@ class ChatSession:
         filters: SearchFilters | None = None,
         k: int | None = None,
     ) -> ChatAnswer:
+        if not question or not question.strip():
+            raise ValueError("Please type a question.")
+
         standalone_query = self._rewrite_query(question)
         k = k or self.settings.retrieval_top_k
         hits = self.retriever.search(standalone_query, k=k, filters=filters)
@@ -71,11 +74,10 @@ class ChatSession:
         search_result_blocks = hits_to_search_results(hits)
         user_content: list[dict] = [*search_result_blocks, {"type": "text", "text": question}]
 
-        messages: list[dict] = []
-        for prior_question, prior_answer in self.history:
-            messages.append({"role": "user", "content": prior_question})
-            messages.append({"role": "assistant", "content": prior_answer})
-        messages.append({"role": "user", "content": user_content})
+        messages: list[dict] = [
+            *self._history_messages(),
+            {"role": "user", "content": user_content},
+        ]
 
         system_prompt = SOURCES_ONLY_SYSTEM_PROMPT if mode == "sources" else OPEN_SYSTEM_PROMPT
         tools = None
@@ -114,6 +116,22 @@ class ChatSession:
     def _plain_text(answer: ChatAnswer) -> str:
         """The answer text without citation markers, for chat history."""
         return "".join(segment.text for segment in answer.segments)
+
+    def _history_messages(self) -> list[dict]:
+        """Prior turns as user/assistant text-block messages, with a cache
+        breakpoint on the last block of the most recent turn (the previous
+        assistant answer). History is append-only plain text, so this
+        prefix is byte-identical across requests and reliably caches.
+        """
+        messages: list[dict] = []
+        for prior_question, prior_answer in self.history:
+            messages.append({"role": "user", "content": [{"type": "text", "text": prior_question}]})
+            messages.append(
+                {"role": "assistant", "content": [{"type": "text", "text": prior_answer}]}
+            )
+        if messages:
+            messages[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}
+        return messages
 
     def _not_in_sources_answer(
         self, question: str, standalone_query: str, mode: ChatMode
@@ -167,9 +185,14 @@ class ChatSession:
         kwargs: dict[str, Any] = {
             "model": self.settings.chat_model,
             "max_tokens": self.settings.chat_max_tokens,
-            "system": system_prompt,
+            "system": [
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
             "output_config": {"effort": self.settings.chat_effort},
-            "cache_control": {"type": "ephemeral"},
         }
         if tools:
             kwargs["tools"] = tools

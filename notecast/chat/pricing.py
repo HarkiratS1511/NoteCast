@@ -15,7 +15,14 @@ PRICES_PER_MTOK: dict[str, dict[str, float]] = {
 }
 
 CACHE_WRITE_MULTIPLIER = 1.25
+# Default cache-read multiplier (of the model's input price); some models
+# price cache reads differently — see _CACHE_READ_MULTIPLIER_OVERRIDES.
 CACHE_READ_MULTIPLIER = 0.10
+# claude-opus-5-5 cache reads are $0.20/MTok, i.e. 0.05x its $4 input price
+# (not the usual 0.10x) — see notecast/chat/pricing.py's module docstring.
+_CACHE_READ_MULTIPLIER_OVERRIDES: dict[str, float] = {
+    "claude-opus-5-5": 0.05,
+}
 WEB_SEARCH_PRICE_PER_1000 = 10.00
 
 
@@ -36,12 +43,13 @@ def estimate_cost(model: str, usage: dict) -> float | None:
     cache_read_tokens = usage.get("cache_read_tokens", 0) or 0
     cache_write_tokens = usage.get("cache_write_tokens", 0) or 0
     web_searches = usage.get("web_searches", 0) or 0
+    cache_read_multiplier = _CACHE_READ_MULTIPLIER_OVERRIDES.get(model, CACHE_READ_MULTIPLIER)
 
     cost = (
         input_tokens / 1_000_000 * prices["input"]
         + output_tokens / 1_000_000 * prices["output"]
         + cache_write_tokens / 1_000_000 * prices["input"] * CACHE_WRITE_MULTIPLIER
-        + cache_read_tokens / 1_000_000 * prices["input"] * CACHE_READ_MULTIPLIER
+        + cache_read_tokens / 1_000_000 * prices["input"] * cache_read_multiplier
         + web_searches / 1000 * WEB_SEARCH_PRICE_PER_1000
     )
     return cost

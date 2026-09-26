@@ -195,7 +195,7 @@ def test_open_mode_includes_web_search_tool_sources_mode_does_not() -> None:
     assert "tools" not in sources_kwargs
 
 
-def test_request_uses_settings_models_effort_and_cache_control_no_temperature() -> None:
+def test_request_uses_settings_models_and_effort_no_temperature() -> None:
     retriever = FakeRetriever([_hit()])
     client = FakeClient(stream_responses=[_end_turn_message()])
     settings = _settings(chat_effort="high", chat_max_tokens=12000)
@@ -207,13 +207,64 @@ def test_request_uses_settings_models_effort_and_cache_control_no_temperature() 
     assert kwargs["model"] == "claude-sonnet-5"
     assert kwargs["max_tokens"] == 12000
     assert kwargs["output_config"] == {"effort": "high"}
-    assert kwargs["cache_control"] == {"type": "ephemeral"}
     assert "temperature" not in kwargs
     assert "top_p" not in kwargs
     assert "top_k" not in kwargs
     # No assistant prefill: every message we send is user or assistant text,
     # and the outbound request always ends on a user turn.
     assert kwargs["messages"][-1]["role"] == "user"
+
+
+def test_system_prompt_sent_as_cached_block_no_top_level_cache_control() -> None:
+    retriever = FakeRetriever([_hit()])
+    client = FakeClient(stream_responses=[_end_turn_message()])
+    session = ChatSession(retriever, settings=_settings(), client=client)
+
+    session.ask("question", mode="sources")
+
+    kwargs = client.messages.stream_calls[0]
+    assert "cache_control" not in kwargs
+    assert kwargs["system"] == [
+        {
+            "type": "text",
+            "text": kwargs["system"][0]["text"],
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+
+
+def test_first_turn_has_no_history_cache_breakpoint() -> None:
+    retriever = FakeRetriever([_hit()])
+    client = FakeClient(stream_responses=[_end_turn_message()])
+    session = ChatSession(retriever, settings=_settings(), client=client)
+
+    session.ask("question")
+
+    messages = client.messages.stream_calls[0]["messages"]
+    # No history yet, so the only message is the new user turn — nothing
+    # should carry a cache_control breakpoint.
+    assert len(messages) == 1
+    assert "cache_control" not in messages[0]["content"][-1]
+
+
+def test_second_turn_cache_breakpoint_on_last_history_block_only() -> None:
+    retriever = FakeRetriever([_hit()])
+    client = FakeClient(stream_responses=[_end_turn_message()])
+    session = ChatSession(retriever, settings=_settings(), client=client)
+    session.history.append(("earlier question", "earlier answer"))
+
+    session.ask("question")
+
+    messages = client.messages.stream_calls[0]["messages"]
+    # [user(history q), assistant(history a, cached), user(new turn)]
+    assert len(messages) == 3
+    assert messages[0]["role"] == "user"
+    assert "cache_control" not in messages[0]["content"][-1]
+    assert messages[1]["role"] == "assistant"
+    assert messages[1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    # The new turn's search_result/question blocks must not be cached.
+    new_turn_content = messages[2]["content"]
+    assert all("cache_control" not in block for block in new_turn_content)
 
 
 def test_pause_turn_continues_and_accumulates_usage() -> None:
@@ -313,6 +364,19 @@ def test_cost_estimate_is_populated_for_known_model() -> None:
 
     assert answer.usage.est_cost_usd is not None
     assert answer.usage.est_cost_usd > 0
+
+
+@pytest.mark.parametrize("question", ["", "   ", "\n\t"])
+def test_empty_question_raises_value_error(question: str) -> None:
+    retriever = FakeRetriever([_hit()])
+    client = FakeClient(stream_responses=[])
+    session = ChatSession(retriever, settings=_settings(), client=client)
+
+    with pytest.raises(ValueError, match="Please type a question."):
+        session.ask(question)
+
+    assert retriever.calls == []
+    assert client.messages.stream_calls == []
 
 
 def test_reset_clears_history() -> None:

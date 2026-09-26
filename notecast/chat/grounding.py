@@ -11,7 +11,7 @@ from typing import Any
 
 from notecast.chat.models import AnswerSegment, Citation
 from notecast.chat.prompts import NOT_IN_SOURCES_TOKEN
-from notecast.models import SearchHit, SourceType
+from notecast.models import SearchHit
 
 _MAX_BLOCKS_PER_RESULT = 12
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
@@ -49,9 +49,6 @@ def _group_units(
 
 
 def _is_slide_like(chunk: Any) -> bool:
-    source_type = getattr(chunk, "source_type", None)
-    if source_type in (SourceType.PPTX, SourceType.PDF):
-        return True
     return getattr(chunk.location, "slide", None) is not None
 
 
@@ -78,7 +75,7 @@ def hits_to_search_results(hits: list[SearchHit]) -> list[dict]:
         chunk = hit.chunk
         blocks = _split_chunk_text(chunk)
         if not blocks:
-            blocks = [chunk.text or ""]
+            blocks = [(chunk.text or "").strip()]
         results.append(
             {
                 "type": "search_result",

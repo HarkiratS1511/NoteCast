@@ -98,6 +98,41 @@ def test_empty_chunk_text_still_yields_one_block() -> None:
     assert results[0]["content"][0]["text"] == ""
 
 
+def test_whitespace_only_chunk_text_yields_single_empty_block() -> None:
+    chunk = Chunk(
+        chunk_id="whitespace1",
+        course="comp4650",
+        source_path="week-01/blank.pdf",
+        source_type=SourceType.PDF,
+        ordinal=0,
+        text="   \n\t  ",
+        header="Blank",
+        location=Location(page=1),
+    )
+    results = hits_to_search_results([SearchHit(chunk=chunk, score=1.0)])
+    assert len(results[0]["content"]) == 1
+    assert results[0]["content"][0]["text"] == ""
+
+
+def test_prose_pdf_without_slide_location_split_by_sentences() -> None:
+    """A PDF chunk with no slide number (a real prose document, not a
+    slide export) should be split like flowing text, not like slides.
+    """
+    text = " ".join(f"This is sentence number {i}." for i in range(20))
+    chunk = Chunk(
+        chunk_id="prose1",
+        course="comp4650",
+        source_path="week-01/notes.pdf",
+        source_type=SourceType.PDF,
+        ordinal=0,
+        text=text,
+        header="Notes",
+        location=Location(page=3),
+    )
+    results = hits_to_search_results([SearchHit(chunk=chunk, score=1.0)])
+    assert all("\n" not in block["text"] for block in results[0]["content"])
+
+
 def _dict_message(content: list[dict]) -> dict:
     return {"content": content, "stop_reason": "end_turn"}
 
