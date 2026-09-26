@@ -161,7 +161,7 @@ class PptxParser:
     def parse(self, path: Path, source_path: str) -> ParsedDocument:
         try:
             presentation = Presentation(str(path))
-        except (PptxPackageNotFoundError, zipfile.BadZipFile, KeyError) as exc:
+        except (PptxPackageNotFoundError, zipfile.BadZipFile, KeyError, ValueError) as exc:
             raise ValueError(
                 f"Could not open {path.name} as a PowerPoint file (it may be corrupt "
                 "or not a valid .pptx file)."
@@ -259,10 +259,23 @@ def _paragraph_text(paragraph: Paragraph) -> str:
     return text
 
 
+def _cell_text_docx(cell: Any) -> str:
+    """A table cell's own paragraph text, plus any nested tables flattened
+    into the same string (rows joined with " ; ") so nothing is lost.
+    """
+    paragraph_text = " ".join(p.text.strip() for p in cell.paragraphs if p.text.strip())
+    nested_parts = [paragraph_text] if paragraph_text else []
+    for nested_table in cell.tables:
+        nested_rows = _table_lines_docx(nested_table)
+        if nested_rows:
+            nested_parts.append(" ; ".join(nested_rows))
+    return " ".join(nested_parts).strip()
+
+
 def _table_lines_docx(table: Table) -> list[str]:
     lines = []
     for row in table.rows:
-        cells = [cell.text.strip() for cell in row.cells]
+        cells = [_cell_text_docx(cell) for cell in row.cells]
         if any(cells):
             lines.append(" | ".join(cells))
     return lines

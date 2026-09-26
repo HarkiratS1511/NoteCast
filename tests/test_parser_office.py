@@ -184,6 +184,18 @@ class TestPptxParser:
         with pytest.raises(ValueError, match="PowerPoint"):
             PptxParser().parse(path, "corrupt.pptx")
 
+    def test_wrong_ooxml_type_raises_friendly_value_error(self, tmp_path: Path) -> None:
+        # A valid zip / OOXML package, but the wrong kind (a .docx saved
+        # with a .pptx extension) makes python-pptx raise its own bare
+        # ValueError deep inside package loading; we must catch that too.
+        document = Document()
+        document.add_paragraph("Just a Word document.")
+        path = tmp_path / "actually_docx.pptx"
+        document.save(str(path))
+
+        with pytest.raises(ValueError, match="PowerPoint"):
+            PptxParser().parse(path, "actually_docx.pptx")
+
 
 # ---------------------------------------------------------------------------
 # DOCX fixtures
@@ -329,6 +341,41 @@ class TestDocxParser:
 
         with pytest.raises(ValueError, match="Word"):
             DocxParser().parse(path, "corrupt.docx")
+
+    def test_wrong_ooxml_type_raises_friendly_value_error(self, tmp_path: Path) -> None:
+        # A valid zip / OOXML package, but the wrong kind (a .pptx saved
+        # with a .docx extension) already worked before this fix; lock it in.
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[1])
+        slide.shapes.title.text = "Just a PowerPoint file"
+        path = tmp_path / "actually_pptx.docx"
+        prs.save(str(path))
+
+        with pytest.raises(ValueError, match="Word"):
+            DocxParser().parse(path, "actually_pptx.docx")
+
+    def test_nested_table_in_cell_is_not_lost(self, tmp_path: Path) -> None:
+        document = Document()
+        table = document.add_table(rows=2, cols=2)
+        table.cell(0, 0).text = "outer"
+        table.cell(0, 1).text = "plain"
+        table.cell(1, 0).text = "x"
+        table.cell(1, 1).text = "y"
+
+        nested = table.cell(0, 0).add_table(rows=1, cols=2)
+        nested.cell(0, 0).text = "a"
+        nested.cell(0, 1).text = "b"
+
+        path = tmp_path / "nested_table.docx"
+        document.save(str(path))
+
+        doc = DocxParser().parse(path, "nested_table.docx")
+        assert len(doc.sections) == 1
+        text = doc.sections[0].text
+        assert "a" in text
+        assert "b" in text
+        assert "plain" in text
+        assert "x | y" in text
 
 
 # ---------------------------------------------------------------------------
