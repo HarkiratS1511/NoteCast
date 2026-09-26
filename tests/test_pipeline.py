@@ -171,6 +171,100 @@ def test_load_chunks_reads_manifested_sources(tmp_notebooks_root: Path) -> None:
     assert {c.source_path for c in chunks} == {"a.txt", "b.txt"}
 
 
+def test_on_chunks_failure_recorded_and_manifest_entry_dropped(tmp_notebooks_root: Path) -> None:
+    nb = Notebook.create("my-course", root=tmp_notebooks_root)
+    (nb.sources_dir / "good.txt").write_text("hello world")
+    (nb.sources_dir / "bad.txt").write_text("goodbye world")
+
+    def flaky_on_chunks(source_path: str, chunks: list) -> None:  # noqa: ANN001
+        if source_path == "bad.txt":
+            raise RuntimeError("embed boom")
+
+    report = ingest_notebook(nb, on_chunks=flaky_on_chunks)
+
+    assert report.added == ["good.txt"]
+    assert report.failed == {"bad.txt": "embed boom"}
+
+    manifest = pipeline.manifest_mod.load_manifest(nb)
+    assert "good.txt" in manifest.entries
+    assert "bad.txt" not in manifest.entries
+    # Processed output was still written (parsing/chunking succeeded); only
+    # the manifest entry (and thus "is this file up to date") is withheld.
+    assert (nb.processed_dir / "bad.txt.chunks.jsonl").exists()
+
+
+def test_on_chunks_failure_on_update_drops_existing_manifest_entry(
+    tmp_notebooks_root: Path,
+) -> None:
+    nb = Notebook.create("my-course", root=tmp_notebooks_root)
+    source = nb.sources_dir / "notes.txt"
+    source.write_text("hello world")
+    ingest_notebook(nb)
+    manifest = pipeline.manifest_mod.load_manifest(nb)
+    assert "notes.txt" in manifest.entries
+
+    source.write_text("hello world, updated")
+
+    def failing_on_chunks(source_path: str, chunks: list) -> None:  # noqa: ANN001
+        raise RuntimeError("embed boom")
+
+    report = ingest_notebook(nb, on_chunks=failing_on_chunks)
+
+    assert report.updated == []
+    assert report.failed == {"notes.txt": "embed boom"}
+    manifest = pipeline.manifest_mod.load_manifest(nb)
+    assert "notes.txt" not in manifest.entries
+
+    # A later normal run (no failure) must treat it as new again, not as
+    # already up to date.
+    report2 = ingest_notebook(nb)
+    assert report2.added == ["notes.txt"]
+    assert report2.failed == {}
+
+
+def test_on_removed_failure_is_retried_next_run(tmp_notebooks_root: Path) -> None:
+    nb = Notebook.create("my-course", root=tmp_notebooks_root)
+    source = nb.sources_dir / "notes.txt"
+    source.write_text("hello world")
+    ingest_notebook(nb)
+    source.unlink()
+
+    calls: list[str] = []
+
+    def flaky_on_removed(source_path: str) -> None:
+        calls.append(source_path)
+        if len(calls) == 1:
+            raise RuntimeError("delete boom")
+
+    report1 = ingest_notebook(nb, on_removed=flaky_on_removed)
+    assert report1.removed == []
+    assert report1.failed == {"notes.txt": "delete boom"}
+    manifest = pipeline.manifest_mod.load_manifest(nb)
+    assert "notes.txt" in manifest.entries
+    # Processed files are kept too, so a later successful removal call
+    # doesn't need anything re-parsed.
+    assert (nb.processed_dir / "notes.txt.chunks.jsonl").exists()
+
+    report2 = ingest_notebook(nb, on_removed=flaky_on_removed)
+    assert report2.removed == ["notes.txt"]
+    assert report2.failed == {}
+    manifest = pipeline.manifest_mod.load_manifest(nb)
+    assert "notes.txt" not in manifest.entries
+    assert not (nb.processed_dir / "notes.txt.chunks.jsonl").exists()
+
+
+def test_load_source_chunks_reads_one_source(tmp_notebooks_root: Path) -> None:
+    nb = Notebook.create("my-course", root=tmp_notebooks_root)
+    (nb.sources_dir / "a.txt").write_text("hello world")
+    (nb.sources_dir / "b.txt").write_text("goodbye world")
+    ingest_notebook(nb)
+
+    chunks = pipeline.load_source_chunks(nb, "a.txt")
+    assert {c.source_path for c in chunks} == {"a.txt"}
+
+    assert pipeline.load_source_chunks(nb, "missing.txt") == []
+
+
 def test_manifest_survives_crash_after_each_file(tmp_notebooks_root: Path) -> None:
     nb = Notebook.create("my-course", root=tmp_notebooks_root)
     (nb.sources_dir / "notes.txt").write_text("hello world")

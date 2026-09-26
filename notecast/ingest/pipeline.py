@@ -134,7 +134,16 @@ def ingest_notebook(
             continue
 
         if on_chunks:
-            on_chunks(source_path, chunks)
+            try:
+                on_chunks(source_path, chunks)
+            except Exception as exc:  # noqa: BLE001 -- one bad file must not stop the run
+                report.failed[source_path] = str(exc)
+                # Drop any existing manifest entry so this file is retried
+                # (not silently treated as "unchanged") next run, whatever
+                # partial state `on_chunks` left the index in.
+                m.entries.pop(source_path, None)
+                manifest_mod.save_manifest(nb, m)
+                continue
 
         m.entries[source_path] = ManifestEntry(
             source_path=source_path,
@@ -154,13 +163,35 @@ def ingest_notebook(
     removed_paths = [sp for sp in m.entries if sp not in current_paths]
     for source_path in removed_paths:
         if on_removed:
-            on_removed(source_path)
+            try:
+                on_removed(source_path)
+            except Exception as exc:  # noqa: BLE001 -- one bad removal must not stop the run
+                report.failed[source_path] = str(exc)
+                # Keep the manifest entry (and processed files) so removal
+                # is retried next run instead of the source being silently
+                # dropped from the manifest while still sitting in the index.
+                continue
         _delete_processed(nb, source_path)
         del m.entries[source_path]
         report.removed.append(source_path)
 
     manifest_mod.save_manifest(nb, m)
     return report
+
+
+def load_source_chunks(nb: Notebook, source_path: str) -> list[Chunk]:
+    """Read one already-ingested source's chunks from its `.chunks.jsonl`
+    file (without re-parsing or re-chunking). Empty list if it doesn't exist.
+    """
+    path = _chunks_path(nb, source_path)
+    if not path.exists():
+        return []
+    chunks: list[Chunk] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            chunks.append(Chunk.model_validate_json(line))
+    return chunks
 
 
 def load_chunks(nb: Notebook) -> list[Chunk]:
@@ -170,11 +201,5 @@ def load_chunks(nb: Notebook) -> list[Chunk]:
     m = manifest_mod.load_manifest(nb)
     chunks: list[Chunk] = []
     for source_path in sorted(m.entries):
-        path = _chunks_path(nb, source_path)
-        if not path.exists():
-            continue
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line:
-                chunks.append(Chunk.model_validate_json(line))
+        chunks.extend(load_source_chunks(nb, source_path))
     return chunks
