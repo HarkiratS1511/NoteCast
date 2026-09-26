@@ -8,6 +8,7 @@ from __future__ import annotations
 import typer
 
 from notecast import __version__
+from notecast.ingest.pipeline import ingest_notebook
 from notecast.notebook import Notebook
 
 app = typer.Typer(
@@ -71,9 +72,49 @@ def _not_implemented(slug: str, phase: int) -> None:
 
 
 @app.command("ingest")
-def ingest(slug: str) -> None:
-    """Parse and index a notebook's source files. (Phase 1)"""
-    _not_implemented(slug, phase=1)
+def ingest(
+    slug: str,
+    force: bool = typer.Option(
+        False, "--force", help="Reprocess every file even if its content is unchanged."
+    ),
+) -> None:
+    """Parse and chunk a notebook's source files.
+
+    Search indexing (embedding + LanceDB) arrives in Phase 2; this command
+    covers parsing, chunking and the manifest.
+    """
+    try:
+        notebook = Notebook(slug)
+    except ValueError as exc:
+        typer.echo(f"Could not use notebook: {exc}")
+        raise typer.Exit(code=1) from None
+    if not notebook.exists():
+        typer.echo(f"No notebook named {slug!r}. Create one with: notecast notebooks create {slug}")
+        raise typer.Exit(code=1)
+
+    def _progress(source_path: str, index: int, total: int) -> None:
+        typer.echo(f"[{index}/{total}] {source_path}")
+
+    report = ingest_notebook(notebook, force=force, progress=_progress)
+
+    typer.echo("")
+    typer.echo(
+        f"Added {len(report.added)}, updated {len(report.updated)}, "
+        f"unchanged {len(report.unchanged)}, removed {len(report.removed)}, "
+        f"failed {len(report.failed)}."
+    )
+    typer.echo(f"Chunks produced this run: {report.chunk_count}")
+    if report.failed:
+        typer.echo("")
+        typer.echo("Failures:")
+        for source_path, message in report.failed.items():
+            typer.echo(f"  {source_path}: {message}")
+
+    typer.echo("")
+    typer.echo("Search indexing comes in Phase 2 — this ran parsing and chunking only.")
+
+    if report.failed:
+        raise typer.Exit(code=1)
 
 
 @app.command("chat")
