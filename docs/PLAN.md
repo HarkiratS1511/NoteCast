@@ -118,7 +118,7 @@ Parallel tracks are in brackets; they run as simultaneous Sonnet builders.
 | **4. Modes** | open mode + web search, Deep (full-context + caching) mode | [web search] [deep mode] | Done |
 | **5. Multi-notebook** | create/list/switch/delete courses, scope filters | single builder | Done |
 | **6. Audio overview** | key points → rank → adaptive outline → chapter scripts → coverage check → Kokoro TTS → stitch | [key points+ranking] [script+coverage] [TTS+stitch] | Done |
-| **7. UI** | chosen front end (Streamlit) | depends on choice | In verification — built, not yet checked end-to-end with a real API key |
+| **7. UI** | chosen front end (Streamlit) | depends on choice | Done — verified with a fake Claude; real-API run pending |
 | **8. Extras** | quiz/flashcards/study guide; later maybe Whisper transcription and OCR | parallel per feature | Not started |
 
 Phase 1 must be solid before anything else, same as the original plan.

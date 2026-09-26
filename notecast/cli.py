@@ -5,6 +5,8 @@ later phases.
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 import click
@@ -612,6 +614,21 @@ def audio_render(slug: str, script_json: Path) -> None:
     _warn_if_stale(saved.stale_chunk_ids)
     typer.echo(f"Audio: {saved.render.mp3_path}")
     typer.echo(f"Transcript: {saved.render.transcript_path}")
+
+
+@app.command("ui")
+def ui(
+    port: int = typer.Option(8501, "--port", help="Port for the local web UI."),
+) -> None:
+    """Open the NoteCast web UI in your browser (runs locally, Ctrl-C to stop)."""
+    app_path = Path(__file__).resolve().parent / "ui" / "app.py"
+    cmd = [sys.executable, "-m", "streamlit", "run", str(app_path), "--server.port", str(port)]
+    typer.echo(f"Starting NoteCast UI on http://localhost:{port} (Ctrl-C to stop)")
+    try:
+        result = subprocess.run(cmd, check=False)
+    except KeyboardInterrupt:
+        return
+    raise typer.Exit(code=result.returncode)
 
 
 if __name__ == "__main__":

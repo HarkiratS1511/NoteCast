@@ -190,7 +190,7 @@ Rendering itself runs on CPU and is roughly 3x faster than real time — a
 ## 6. Web UI
 
 ```bash
-uv run streamlit run notecast/ui/app.py
+uv run notecast ui
 ```
 
 Opens a local browser tab: notebook picker, ingest button, chat with mode

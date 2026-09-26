@@ -82,7 +82,7 @@ uv run notecast ask comp3000 "What is TF-IDF?"
 uv run notecast chat comp3000 --mode deep      # whole-course context, shows a cost estimate first
 uv run notecast audio comp3000 --week 1        # generate a two-host audio overview
 
-uv run streamlit run notecast/ui/app.py        # local web UI: chat + audio, same core as the CLI
+uv run notecast ui        # local web UI: chat + audio, same core as the CLI
 ```
 
 For the full day-to-day guide (every command, all three chat modes,

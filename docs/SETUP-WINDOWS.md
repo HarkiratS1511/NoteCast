@@ -229,7 +229,7 @@ NoteCast also has a local web UI, built with Streamlit, covering the same
 chat and audio features as the command line:
 
 ```powershell
-uv run streamlit run notecast/ui/app.py
+uv run notecast ui
 ```
 
 This should open a new browser tab automatically (or print a `localhost`

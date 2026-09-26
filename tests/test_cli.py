@@ -903,3 +903,23 @@ def test_audio_render_missing_script_file(tmp_notebooks_root: Path) -> None:
     result = runner.invoke(app, ["audio-render", "my-course", str(missing)])
     assert result.exit_code == 1
     assert "No script file" in result.output
+
+
+def test_ui_launches_streamlit_with_app_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    calls: list[list[str]] = []
+
+    class _Done:
+        returncode = 0
+
+    def fake_run(cmd, check=False):  # noqa: ANN001
+        calls.append(cmd)
+        return _Done()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = runner.invoke(app, ["ui", "--port", "8600"])
+    assert result.exit_code == 0
+    assert calls and calls[0][1:4] == ["-m", "streamlit", "run"]
+    assert calls[0][4].endswith(str(Path("notecast") / "ui" / "app.py"))
+    assert calls[0][-2:] == ["--server.port", "8600"]
