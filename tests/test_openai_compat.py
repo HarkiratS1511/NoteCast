@@ -5,6 +5,7 @@ with a fully fake `openai` client — no network access.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -20,6 +21,7 @@ from notecast.config import Settings
 from notecast.models import Chunk, Location, SearchHit, SourceType
 from notecast.providers.openai_compat import (
     OpenAICompatClient,
+    _strip_leaked_reasoning,
     map_openai_error,
 )
 
@@ -156,6 +158,67 @@ def test_plain_text_message_passthrough_no_sources() -> None:
     assert len(message.content) == 1
     assert message.content[0].text == "An answer with no citations."
     assert message.content[0].citations is None
+
+
+# --- system_prompt_overwrite -----------------------------------------------
+
+
+def test_system_prompt_overwrite_sent_when_enabled() -> None:
+    fake = FakeOpenAI(responses=[_completion("hi")])
+    settings = _settings(agentaus_system_prompt_overwrite=True)
+    client = OpenAICompatClient(settings, openai_client=fake)
+    client.messages.create(
+        model="agentaus-model",
+        max_tokens=100,
+        system="Be helpful.",
+        messages=[{"role": "user", "content": "Hello?"}],
+    )
+    request = fake.completions.calls[0]
+    assert request["extra_body"] == {"system_prompt_overwrite": True}
+
+
+def test_system_prompt_overwrite_not_sent_when_disabled() -> None:
+    fake = FakeOpenAI(responses=[_completion("hi")])
+    client = OpenAICompatClient(
+        _settings(agentaus_system_prompt_overwrite=False), openai_client=fake
+    )
+    client.messages.create(
+        model="agentaus-model",
+        max_tokens=100,
+        system="Be helpful.",
+        messages=[{"role": "user", "content": "Hello?"}],
+    )
+    request = fake.completions.calls[0]
+    assert "extra_body" not in request
+
+
+def test_system_prompt_overwrite_adds_minimal_system_prompt_when_none_given() -> None:
+    fake = FakeOpenAI(responses=[_completion("hi")])
+    settings = _settings(agentaus_system_prompt_overwrite=True)
+    client = OpenAICompatClient(settings, openai_client=fake)
+    client.messages.create(
+        model="agentaus-model",
+        max_tokens=100,
+        messages=[{"role": "user", "content": "Hello?"}],
+    )
+    request = fake.completions.calls[0]
+    assert request["messages"][0]["role"] == "system"
+    assert request["messages"][0]["content"]
+    assert request["extra_body"] == {"system_prompt_overwrite": True}
+
+
+def test_no_system_prompt_added_when_overwrite_disabled_and_none_given() -> None:
+    fake = FakeOpenAI(responses=[_completion("hi")])
+    client = OpenAICompatClient(
+        _settings(agentaus_system_prompt_overwrite=False), openai_client=fake
+    )
+    client.messages.create(
+        model="agentaus-model",
+        max_tokens=100,
+        messages=[{"role": "user", "content": "Hello?"}],
+    )
+    request = fake.completions.calls[0]
+    assert request["messages"][0]["role"] == "user"
 
 
 # --- search_result numbering across multiple messages (deep mode shape) --
@@ -537,6 +600,180 @@ def test_unterminated_think_block_left_untouched() -> None:
     assert message.content[0].text == "<think>never closes the answer"
 
 
+# --- Raw control-token and plain-text reasoning leak stripping -------------
+
+
+def test_control_token_leak_cuts_reply_at_first_marker() -> None:
+    fake = FakeOpenAI(
+        responses=[_completion("The answer is 42.<|start|>assistant<|channel|>commentary blah")]
+    )
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model", max_tokens=100, system="sys", messages=[]
+    )
+    assert message.content[0].text == "The answer is 42."
+
+
+def test_control_token_leak_at_start_leaves_empty_text() -> None:
+    fake = FakeOpenAI(responses=[_completion("<|start|>assistant<|channel|>commentary blah")])
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model", max_tokens=100, system="sys", messages=[]
+    )
+    assert message.content[0].text == ""
+
+
+def test_leaked_reasoning_paragraph_stripped() -> None:
+    fake = FakeOpenAI(
+        responses=[_completion("We should use web search.\nActually, the answer is 42.")]
+    )
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model", max_tokens=100, system="sys", messages=[]
+    )
+    assert message.content[0].text == "Actually, the answer is 42."
+
+
+@pytest.mark.parametrize(
+    "leading_line",
+    [
+        "I need to check the sources first.",
+        "The user asks about gradient descent.",
+        "Let's think about how to answer the question.",
+        "Okay, we should answer directly.",
+        "So, the user wants a definition.",
+    ],
+)
+def test_various_leaked_reasoning_openers_stripped(leading_line: str) -> None:
+    fake = FakeOpenAI(responses=[_completion(f"{leading_line}\nThe real answer follows.")])
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model", max_tokens=100, system="sys", messages=[]
+    )
+    assert message.content[0].text == "The real answer follows."
+
+
+def test_legitimate_answer_starting_with_we_define_not_stripped() -> None:
+    fake = FakeOpenAI(
+        responses=[_completion("We define entropy as a measure of uncertainty.\nMore detail.")]
+    )
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model", max_tokens=100, system="sys", messages=[]
+    )
+    assert message.content[0].text == (
+        "We define entropy as a measure of uncertainty.\nMore detail."
+    )
+
+
+def test_legitimate_answer_starting_with_i_should_note_not_stripped() -> None:
+    """ "I should note that ..." matches the modal opener but doesn't
+    reference the task/tooling, so it's a real answer, not a leak.
+    """
+    fake = FakeOpenAI(
+        responses=[_completion("I should note that the lecture defines X.\nMore text follows.")]
+    )
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model", max_tokens=100, system="sys", messages=[]
+    )
+    assert message.content[0].text == (
+        "I should note that the lecture defines X.\nMore text follows."
+    )
+
+
+def test_legitimate_answer_starting_with_we_will_see_not_stripped() -> None:
+    fake = FakeOpenAI(
+        responses=[_completion("We will see that entropy measures uncertainty.\nMore detail.")]
+    )
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model", max_tokens=100, system="sys", messages=[]
+    )
+    assert message.content[0].text == (
+        "We will see that entropy measures uncertainty.\nMore detail."
+    )
+
+
+def test_leaked_opener_with_task_keyword_web_search_still_stripped() -> None:
+    fake = FakeOpenAI(responses=[_completion("We should use web search.\nAnswer follows.")])
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model", max_tokens=100, system="sys", messages=[]
+    )
+    assert message.content[0].text == "Answer follows."
+
+
+def test_leaked_opener_with_task_keywords_answer_and_sources_still_stripped() -> None:
+    fake = FakeOpenAI(
+        responses=[
+            _completion(
+                "I need to answer the question using the sources.\nHere is the real answer."
+            )
+        ]
+    )
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model", max_tokens=100, system="sys", messages=[]
+    )
+    assert message.content[0].text == "Here is the real answer."
+
+
+def test_leading_line_with_citation_marker_not_stripped() -> None:
+    hit1 = _hit("c1", "Some content.")
+    sources = hits_to_search_results([hit1])
+    fake = FakeOpenAI(
+        responses=[_completion("We can see from slide 3 [1] that this holds.\nMore detail.")]
+    )
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model",
+        max_tokens=100,
+        system="sys",
+        messages=[{"role": "user", "content": [*sources, {"type": "text", "text": "Q"}]}],
+    )
+    full_text = "".join(b.text for b in message.content)
+    assert full_text.startswith("We can see from slide 3 ")
+
+
+def test_leaked_reasoning_not_stripped_when_nothing_follows() -> None:
+    fake = FakeOpenAI(responses=[_completion("We should use web search.")])
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model", max_tokens=100, system="sys", messages=[]
+    )
+    assert message.content[0].text == "We should use web search."
+
+
+def test_leaked_reasoning_not_stripped_when_only_blank_line_follows() -> None:
+    fake = FakeOpenAI(responses=[_completion("We should use web search.\n   \n")])
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model", max_tokens=100, system="sys", messages=[]
+    )
+    assert message.content[0].text == "We should use web search.\n   \n"
+
+
+def test_leaked_reasoning_not_stripped_when_no_trailing_period() -> None:
+    fake = FakeOpenAI(responses=[_completion("We should use web search\nActual answer follows.")])
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model", max_tokens=100, system="sys", messages=[]
+    )
+    assert message.content[0].text == "We should use web search\nActual answer follows."
+
+
+def test_leaked_reasoning_not_stripped_when_over_max_len() -> None:
+    long_line = "We should " + ("really " * 60) + "search for this."
+    assert len(long_line) > 300
+    fake = FakeOpenAI(responses=[_completion(f"{long_line}\nActual answer follows.")])
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model", max_tokens=100, system="sys", messages=[]
+    )
+    assert message.content[0].text == f"{long_line}\nActual answer follows."
+
+
 # --- max_tokens clamping ----------------------------------------------------
 
 
@@ -636,6 +873,76 @@ def test_response_format_400_falls_back_and_is_remembered() -> None:
     assert "response_format" not in fake.completions.calls[2]
 
 
+def test_json_retry_appends_assistant_reply_and_fix_instruction() -> None:
+    fake = FakeOpenAI(
+        responses=[_completion("here is some prose, not JSON"), _completion('{"ok": true}')]
+    )
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    schema = {"type": "object"}
+    message = client.messages.create(
+        model="agentaus-model",
+        max_tokens=100,
+        system="sys",
+        messages=[{"role": "user", "content": "Give me JSON."}],
+        output_config={"format": {"type": "json_schema", "schema": schema}},
+    )
+    assert message.content[0].text == '{"ok": true}'
+    assert len(fake.completions.calls) == 2
+    retry_messages = fake.completions.calls[1]["messages"]
+    assert retry_messages[-2] == {
+        "role": "assistant",
+        "content": "here is some prose, not JSON",
+    }
+    assert retry_messages[-1]["role"] == "user"
+    assert "not valid JSON" in retry_messages[-1]["content"]
+
+
+def test_json_retry_sums_usage_across_both_calls() -> None:
+    fake = FakeOpenAI(
+        responses=[
+            _completion(
+                "prose",
+                usage={"input_tokens": 100, "output_tokens": 10},
+            ),
+            _completion(
+                '{"ok": true}',
+                usage={"input_tokens": 150, "output_tokens": 20},
+            ),
+        ]
+    )
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    schema = {"type": "object"}
+    message = client.messages.create(
+        model="agentaus-model",
+        max_tokens=100,
+        system="sys",
+        messages=[],
+        output_config={"format": {"type": "json_schema", "schema": schema}},
+    )
+    assert message.usage.input_tokens == 250
+    assert message.usage.output_tokens == 30
+
+
+def test_json_retry_with_output_format_succeeds_on_second_attempt() -> None:
+    fake = FakeOpenAI(responses=[_completion("nope"), _completion('{"answer": "42"}')])
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.parse(
+        model="agentaus-model", max_tokens=100, system="sys", messages=[], output_format=_Answer
+    )
+    assert message.parsed_output == _Answer(answer="42")
+    assert len(fake.completions.calls) == 2
+
+
+def test_no_json_retry_when_first_attempt_already_valid() -> None:
+    fake = FakeOpenAI(responses=[_completion('{"answer": "42"}')])
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.parse(
+        model="agentaus-model", max_tokens=100, system="sys", messages=[], output_format=_Answer
+    )
+    assert message.parsed_output == _Answer(answer="42")
+    assert len(fake.completions.calls) == 1
+
+
 # --- parse() / stream(output_format=...) ------------------------------------
 
 
@@ -661,13 +968,14 @@ def test_parse_handles_code_fenced_json() -> None:
     assert message.parsed_output == _Answer(answer="42")
 
 
-def test_parse_returns_none_on_invalid_json() -> None:
-    fake = FakeOpenAI(responses=[_completion("not json at all")])
+def test_parse_returns_none_on_invalid_json_after_retry() -> None:
+    fake = FakeOpenAI(responses=[_completion("not json at all"), _completion("still not json")])
     client = OpenAICompatClient(_settings(), openai_client=fake)
     message = client.messages.parse(
         model="agentaus-model", max_tokens=100, system="sys", messages=[], output_format=_Answer
     )
     assert message.parsed_output is None
+    assert len(fake.completions.calls) == 2
 
 
 def test_stream_output_format_via_context_manager() -> None:
@@ -742,6 +1050,90 @@ def test_usage_missing_defaults_to_zeros() -> None:
     assert message.usage.cache_read_input_tokens == 0
 
 
+def test_usage_prefers_agentaus_input_output_tokens_over_openai_names() -> None:
+    fake = FakeOpenAI(
+        responses=[
+            _completion(
+                "ok",
+                usage={
+                    "input_tokens": 120,
+                    "output_tokens": 45,
+                    "prompt_tokens": 999,
+                    "completion_tokens": 999,
+                },
+            )
+        ]
+    )
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model", max_tokens=100, system="sys", messages=[]
+    )
+    assert message.usage.input_tokens == 120
+    assert message.usage.output_tokens == 45
+
+
+def test_usage_falls_back_to_openai_names_when_agentaus_names_absent() -> None:
+    fake = FakeOpenAI(
+        responses=[_completion("ok", usage={"prompt_tokens": 200, "completion_tokens": 60})]
+    )
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model", max_tokens=100, system="sys", messages=[]
+    )
+    assert message.usage.input_tokens == 200
+    assert message.usage.output_tokens == 60
+
+
+def test_usage_input_output_tokens_read_via_real_openai_sdk_round_trip() -> None:
+    """Proves this works end-to-end against the real `openai` SDK — a real
+    `openai.OpenAI` client, over a mocked HTTP transport, whose server
+    response carries ONLY `input_tokens`/`output_tokens` (no
+    `prompt_tokens`/`completion_tokens`/`total_tokens` at all, matching what
+    AgentAUS actually returns) — not just our fakes or a directly
+    `model_validate`-d payload. Also proves the request itself: the URL and
+    that `system_prompt_overwrite` rides as a top-level body field (how
+    `extra_body` actually serialises through the real SDK), not nested.
+    """
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured["url"] = str(request.url)
+        captured["body"] = json.loads(request.content)
+        payload = {
+            "id": "cmpl-real-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "agentaus.v1",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "The answer is 42."},
+                }
+            ],
+            "usage": {"input_tokens": 120, "output_tokens": 45},
+        }
+        return httpx2.Response(200, json=payload, request=request)
+
+    real_openai_client = openai.OpenAI(
+        api_key="test-key",
+        base_url="https://agentaus.com.au/api/v1",
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
+    )
+    settings = _settings(
+        agentaus_base_url="https://agentaus.com.au/api/v1", agentaus_system_prompt_overwrite=True
+    )
+    client = OpenAICompatClient(settings, openai_client=real_openai_client)
+
+    message = client.messages.create(model="agentaus.v1", max_tokens=100, system="sys", messages=[])
+
+    assert message.usage.input_tokens == 120
+    assert message.usage.output_tokens == 45
+    assert message.content[0].text == "The answer is 42."
+    assert captured["url"] == "https://agentaus.com.au/api/v1/chat/completions"
+    assert captured["body"]["system_prompt_overwrite"] is True
+
+
 # --- list_models ---------------------------------------------------------------
 
 
@@ -808,6 +1200,35 @@ def test_error_raised_by_create_is_mapped_to_chat_error() -> None:
         client.messages.create(model="agentaus-model", max_tokens=100, system="sys", messages=[])
 
 
+def test_map_max_model_len_error_uses_configured_context_tokens() -> None:
+    exc = openai.BadRequestError(
+        "This model's maximum context length... max_model_len exceeded",
+        response=_response(400),
+        body=None,
+    )
+    settings = _settings(agentaus_context_tokens=131_072)
+    mapped = map_openai_error(exc, settings)
+    assert "131,072" in str(mapped)
+    assert "context window" in str(mapped)
+    assert "hidden web search" in str(mapped)
+
+
+def test_map_max_model_len_error_without_settings_is_generic() -> None:
+    exc = openai.BadRequestError("max_model_len exceeded", response=_response(400), body=None)
+    mapped = map_openai_error(exc)
+    assert "131k" in str(mapped)
+
+
+def test_max_model_len_error_raised_by_create_is_mapped() -> None:
+    exc = openai.BadRequestError(
+        "max_model_len exceeded, please reduce your input", response=_response(400), body=None
+    )
+    fake = FakeOpenAI(responses=[exc])
+    client = OpenAICompatClient(_settings(agentaus_context_tokens=131_072), openai_client=fake)
+    with pytest.raises(ChatError, match="context window"):
+        client.messages.create(model="agentaus-model", max_tokens=100, system="sys", messages=[])
+
+
 # --- get_client dispatch ---------------------------------------------------------
 
 
@@ -868,3 +1289,16 @@ def test_chat_session_over_agentaus_adapter_with_citations() -> None:
     full_text = "".join(seg.text for seg in answer.segments)
     assert full_text == ("Gradient descent minimises loss . It uses a learning rate .")
     assert answer.not_in_sources is False
+
+
+@pytest.mark.parametrize(
+    "first_line",
+    [
+        "We can use binary search.",
+        "I should point out the answer depends on the prior.",
+        "We will see that the answer is 42.",
+    ],
+)
+def test_content_sentences_with_generic_task_words_not_stripped(first_line: str) -> None:
+    text = f"{first_line}\nMore content follows here."
+    assert _strip_leaked_reasoning(text) == text

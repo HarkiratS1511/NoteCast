@@ -28,6 +28,7 @@ notecast = "notecast.cli:app"
 
 [dependency-groups]
 dev = [
+    "httpx2>=2.13.1",
     "pytest",
     "ruff",
 ]

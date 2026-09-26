@@ -85,6 +85,8 @@ _CITATION_INSTRUCTION = (
     "square brackets inside `backticks` so they are never mistaken for citations."
 )
 
+_DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
+
 _WEB_SEARCH_NOTE = (
     "Web search is unavailable in this deployment. Answer from the course sources given to "
     "you and, where needed, your own general knowledge — clearly label anything from general "
@@ -197,6 +199,12 @@ def _build_request(
     if extra_system_parts:
         system_text = "\n\n".join(part for part in [system_text, *extra_system_parts] if part)
 
+    if not system_text and settings.agentaus_system_prompt_overwrite:
+        # With `system_prompt_overwrite` on, an empty system prompt would
+        # have the server run with no prompt at all rather than its own
+        # hidden default — send a minimal one instead.
+        system_text = _DEFAULT_SYSTEM_PROMPT
+
     final_messages: list[dict[str, str]] = []
     if system_text:
         final_messages.append({"role": "system", "content": system_text})
@@ -205,6 +213,10 @@ def _build_request(
     request: dict[str, Any] = {"model": model, "messages": final_messages}
     if max_tokens is not None:
         request["max_tokens"] = max_tokens
+    if settings.agentaus_system_prompt_overwrite:
+        # Trellis otherwise silently prepends ~2,400 tokens of its own
+        # hidden system prompt in front of ours.
+        request["extra_body"] = {"system_prompt_overwrite": True}
 
     return request, sources, json_requested, parse_model
 
@@ -219,6 +231,71 @@ def _strip_think(text: str) -> str:
     leading `<think>` (no closing tag) is left untouched.
     """
     return _THINK_RE.sub("", text, count=1)
+
+
+def _strip_control_tokens(text: str) -> str:
+    """Cut the reply at the first raw control token, e.g.
+    "<|start|>assistant<|channel|>commentary...". If that leaves nothing,
+    the (possibly empty) text before it is kept as-is.
+    """
+    idx = text.find("<|")
+    if idx == -1:
+        return text
+    return text[:idx]
+
+
+# Plain-text reasoning leaks seen from the default AgentAUS setup (~3% of
+# answers), e.g. "We should use web search.\n<actual answer>". "The user
+# asks/is asking/wants/asked ..." is unambiguous task-meta commentary on its
+# own. The other openers ("We/I should/need to/...", "Let's think/...",
+# "Okay/OK/Alright/So, ...") are also common in genuine answers (e.g. "We
+# will see that entropy measures uncertainty." or "I should note that the
+# lecture defines X.") — those additionally require the line to reference
+# the task or tooling (see `_LEAK_TASK_KEYWORDS_RE`) before being stripped.
+_LEAK_STANDALONE_PATTERNS = [
+    re.compile(r"^The user (asks|is asking|wants|asked)\b"),
+]
+_LEAK_OPENER_PATTERNS = [
+    re.compile(r"^(We|I) (should|need to|must|will|have to|can)\b"),
+    re.compile(r"^Let's (think|answer|see|check)\b"),
+    re.compile(r"^(Okay|OK|Alright|So),? (we|I|let's|the user)\b"),
+]
+_LEAK_TASK_KEYWORDS_RE = re.compile(
+    r"\b("
+    r"web search|search the web|search results|the user|the question|the sources|"
+    r"the documents|the system prompt|respond to|reply to|answer the|cite the|"
+    r"answer directly|use the tool|browse|look up"
+    r")\b",
+    re.IGNORECASE,
+)
+_LEAK_LINE_MAX_LEN = 300
+_BRACKETED_DIGIT_RE = re.compile(r"\[\s*\d")
+
+
+def _strip_leaked_reasoning(text: str) -> str:
+    """Strip a leading plain-text reasoning paragraph (not wrapped in
+    `<think>` tags), only when every guard holds — see module docs. Never
+    strips if doing so would leave nothing.
+    """
+    newline_idx = text.find("\n")
+    if newline_idx == -1:
+        return text
+    first_para = text[:newline_idx]
+    rest = text[newline_idx + 1 :]
+    if not rest.strip():
+        return text
+    if len(first_para) > _LEAK_LINE_MAX_LEN:
+        return text
+    if not first_para.rstrip().endswith("."):
+        return text
+    if _BRACKETED_DIGIT_RE.search(first_para):
+        return text
+    if any(pattern.match(first_para) for pattern in _LEAK_STANDALONE_PATTERNS):
+        return rest
+    matches_opener = any(pattern.match(first_para) for pattern in _LEAK_OPENER_PATTERNS)
+    if matches_opener and _LEAK_TASK_KEYWORDS_RE.search(first_para):
+        return rest
+    return text
 
 
 def _strip_code_fences(text: str) -> str:
@@ -449,6 +526,26 @@ def _cache_read_tokens(usage: Any) -> int:
     return _bget(details, "cached_tokens", 0) or 0
 
 
+def _usage_int(usage: Any, primary_key: str, fallback_key: str) -> int:
+    """Read `primary_key` off `usage` (AgentAUS's own `input_tokens` /
+    `output_tokens`), falling back to the standard OpenAI `fallback_key`
+    (`prompt_tokens` / `completion_tokens`). `primary_key` isn't a field on
+    the real SDK's `CompletionUsage` model, so it only shows up as a pydantic
+    "extra" field — read via plain `getattr` (which pydantic v2 exposes for
+    extra fields when set) and, defensively, via `model_extra` too.
+    """
+    if usage is None:
+        return 0
+    value = _bget(usage, primary_key, None)
+    if value is None:
+        extra = _bget(usage, "model_extra", None)
+        if isinstance(extra, dict):
+            value = extra.get(primary_key)
+    if value is None:
+        value = _bget(usage, fallback_key, 0)
+    return value or 0
+
+
 def _translate_response(
     completion: Any,
     *,
@@ -460,6 +557,8 @@ def _translate_response(
     message = choice.message
     raw_text = _bget(message, "content", "") or ""
     text = _strip_think(raw_text)
+    text = _strip_control_tokens(text)
+    text = _strip_leaked_reasoning(text)
 
     parsed_output: Any = None
     if json_requested:
@@ -479,8 +578,8 @@ def _translate_response(
 
     usage = getattr(completion, "usage", None)
     usage_obj = Usage(
-        input_tokens=(_bget(usage, "prompt_tokens", 0) or 0) if usage is not None else 0,
-        output_tokens=(_bget(usage, "completion_tokens", 0) or 0) if usage is not None else 0,
+        input_tokens=_usage_int(usage, "input_tokens", "prompt_tokens"),
+        output_tokens=_usage_int(usage, "output_tokens", "completion_tokens"),
         cache_read_input_tokens=_cache_read_tokens(usage),
         cache_creation_input_tokens=0,
         server_tool_use=None,
@@ -497,13 +596,39 @@ def _translate_response(
     )
 
 
+_JSON_RETRY_INSTRUCTION = (
+    "Your reply was not valid JSON. Reply with ONLY the JSON object matching the schema — "
+    "no prose, no code fences."
+)
+
+
+def _json_ok(message: Message, parse_model: type | None) -> bool:
+    """True when a JSON-requested response actually produced usable JSON:
+    validated against `parse_model` when one was given, else just
+    extractable as a JSON object at all.
+    """
+    if not message.content:
+        return False
+    if parse_model is not None:
+        return message.parsed_output is not None
+    return _extract_json(message.content[0].text) is not None
+
+
 # --- Error mapping --------------------------------------------------------
 
 
-def map_openai_error(exc: Exception) -> ChatError:
+def map_openai_error(exc: Exception, settings: Settings | None = None) -> ChatError:
     """Map an `openai` SDK exception to a friendly, AgentAUS-specific
     `ChatError`, checking the most specific exception types first.
     """
+    if isinstance(exc, openai.BadRequestError) and "max_model_len" in str(exc).lower():
+        context_tokens = getattr(settings, "agentaus_context_tokens", None)
+        context_label = f"{context_tokens:,}" if context_tokens else "131k"
+        return ChatError(
+            f"The request is too long for AgentAUS's {context_label}-token context window. "
+            "Narrow the scope (fewer weeks/files) and try again. AgentAUS's hidden web search "
+            "can also add tokens; retrying may help."
+        )
     if isinstance(exc, openai.AuthenticationError):
         return ChatError("AgentAUS rejected the API key. Check AGENTAUS_API_KEY in your .env file.")
     if isinstance(exc, openai.NotFoundError):
@@ -597,34 +722,79 @@ class OpenAICompatClient:
         try:
             response = self._client.models.list()
         except openai.OpenAIError as exc:
-            raise map_openai_error(exc) from exc
+            raise map_openai_error(exc, self._settings) from exc
         return [model.id for model in response]
 
-    def _complete(self, **kwargs: Any) -> Message:
-        request, sources, json_requested, parse_model = _build_request(self._settings, kwargs)
-
-        send_response_format = (
-            json_requested and self._settings.agentaus_json_mode and not self._skip_response_format
-        )
-        if send_response_format:
-            request["response_format"] = {"type": "json_object"}
-
+    def _send(self, request: dict[str, Any], send_response_format: bool) -> Any:
+        """One `chat.completions.create` call, with the response_format-400
+        fallback: if the server 400s while `response_format` was sent, retry
+        once without it and remember that on this instance so later calls
+        never send it again.
+        """
         try:
-            completion = self._client.chat.completions.create(**request)
+            return self._client.chat.completions.create(**request)
         except openai.BadRequestError as exc:
             if send_response_format:
                 self._skip_response_format = True
                 retry_request = dict(request)
                 retry_request.pop("response_format", None)
                 try:
-                    completion = self._client.chat.completions.create(**retry_request)
+                    return self._client.chat.completions.create(**retry_request)
                 except openai.OpenAIError as retry_exc:
-                    raise map_openai_error(retry_exc) from retry_exc
-            else:
-                raise map_openai_error(exc) from exc
+                    raise map_openai_error(retry_exc, self._settings) from retry_exc
+            raise map_openai_error(exc, self._settings) from exc
         except openai.OpenAIError as exc:
-            raise map_openai_error(exc) from exc
+            raise map_openai_error(exc, self._settings) from exc
 
-        return _translate_response(
+    def _wants_response_format(self, json_requested: bool) -> bool:
+        return (
+            json_requested and self._settings.agentaus_json_mode and not self._skip_response_format
+        )
+
+    def _complete(self, **kwargs: Any) -> Message:
+        request, sources, json_requested, parse_model = _build_request(self._settings, kwargs)
+
+        send_response_format = self._wants_response_format(json_requested)
+        if send_response_format:
+            request["response_format"] = {"type": "json_object"}
+
+        completion = self._send(request, send_response_format)
+        message = _translate_response(
             completion, sources=sources, json_requested=json_requested, parse_model=parse_model
         )
+
+        if json_requested and not _json_ok(message, parse_model):
+            # AgentAUS accepts `response_format` but doesn't enforce it — a
+            # non-JSON reply gets one retry, appending its own (unhelpful)
+            # reply and asking it to fix it.
+            retry_request = dict(request)
+            retry_request["messages"] = [
+                *request["messages"],
+                {
+                    "role": "assistant",
+                    "content": _bget(completion.choices[0].message, "content", "") or "",
+                },
+                {"role": "user", "content": _JSON_RETRY_INSTRUCTION},
+            ]
+            retry_send_response_format = self._wants_response_format(json_requested)
+            if retry_send_response_format:
+                retry_request["response_format"] = {"type": "json_object"}
+            else:
+                retry_request.pop("response_format", None)
+
+            retry_completion = self._send(retry_request, retry_send_response_format)
+            retry_message = _translate_response(
+                retry_completion,
+                sources=sources,
+                json_requested=json_requested,
+                parse_model=parse_model,
+            )
+            retry_message.usage.input_tokens += message.usage.input_tokens
+            retry_message.usage.output_tokens += message.usage.output_tokens
+            retry_message.usage.cache_read_input_tokens += message.usage.cache_read_input_tokens
+            retry_message.usage.cache_creation_input_tokens += (
+                message.usage.cache_creation_input_tokens
+            )
+            return retry_message
+
+        return message
