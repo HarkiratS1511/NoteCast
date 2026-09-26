@@ -13,6 +13,8 @@ from notecast.audio.keypoints import (
     MERGE_MAX_TOKENS,
     STREAMING_THRESHOLD,
     KeyPointRun,
+    _CompactMergeResult,
+    _fallback_rank,
     _MergeResult,
     extract_key_points,
     group_by_source,
@@ -175,6 +177,11 @@ def extraction_response(points: list[dict[str, Any]]) -> FakeCreateResponse:
 
 def merge_response(points: list[dict[str, Any]]) -> FakeParseResponse:
     parsed = _MergeResult.model_validate({"ranked_points": points})
+    return FakeParseResponse(parsed_output=parsed)
+
+
+def compact_merge_response(groups: list[dict[str, Any]]) -> FakeParseResponse:
+    parsed = _CompactMergeResult.model_validate({"groups": groups})
     return FakeParseResponse(parsed_output=parsed)
 
 
@@ -503,11 +510,12 @@ def test_merge_and_rank_tracks_usage_and_cost(settings: Settings) -> None:
 
 
 def test_merge_and_rank_tracks_agentaus_cost_when_priced() -> None:
+    # AgentAUS routes through the compact merge path (see the
+    # test_compact_merge_* suite below), which expects a {"groups": [...]}
+    # response, not the full {"ranked_points": [...]} shape.
     settings = _agentaus_settings()
     points_by_source = {"a.pdf": [_key_point("Alpha")]}
-    response = merge_response(
-        [{"title": "Alpha", "summary": "s", "source_chunk_ids": ["c1"], "tier": "A"}]
-    )
+    response = compact_merge_response([{"ids": ["p1"], "tier": "A"}])
     response.usage = FakeUsage(input_tokens=1_000_000, output_tokens=1_000_000)
     client = FakeClient(parse_responses=[response])
 
@@ -642,3 +650,230 @@ def test_extraction_ids_do_not_collide_across_same_named_sources(settings: Setti
     points_b = extract_key_points("week-02/slides.pdf", [chunk_b], client=client, settings=settings)
 
     assert points_a[0].id != points_b[0].id
+
+
+# ---------------------------------------------------------------------------
+# merge_and_rank -- AgentAUS compact path
+# ---------------------------------------------------------------------------
+
+
+def test_compact_merge_used_for_agentaus_full_prompt_for_anthropic() -> None:
+    """AgentAUS dispatches through the compact `{"groups": [...]}` shape;
+    Anthropic keeps using the full `{"ranked_points": [...]}` shape --
+    same points, different `output_format` class and prompt.
+    """
+    points_by_source = {"a.pdf": [_key_point("Alpha", id="kp-1", source_chunk_ids=["c1"])]}
+
+    agentaus_settings = _agentaus_settings()
+    agentaus_client = FakeClient(
+        parse_responses=[compact_merge_response([{"ids": ["p1"], "tier": "A"}])]
+    )
+    merge_and_rank(points_by_source, client=agentaus_client, settings=agentaus_settings)
+    [agentaus_call] = agentaus_client.messages.parse_calls
+    assert agentaus_call["output_format"] is _CompactMergeResult
+    assert '"p1"' in agentaus_call["messages"][0]["content"]
+
+    anthropic_settings = Settings(_env_file=None, anthropic_api_key="sk-test")
+    anthropic_client = FakeClient(
+        parse_responses=[
+            merge_response([{"title": "Alpha", "summary": "s", "source_chunk_ids": ["c1"]}])
+        ]
+    )
+    merge_and_rank(points_by_source, client=anthropic_client, settings=anthropic_settings)
+    [anthropic_call] = anthropic_client.messages.parse_calls
+    assert anthropic_call["output_format"] is _MergeResult
+    assert '"p1"' not in anthropic_call["messages"][0]["content"]
+
+
+def test_compact_merge_groups_duplicates_into_one_point() -> None:
+    points_by_source = {
+        "slides.pdf": [
+            _key_point(
+                "Gradient descent",
+                id="kp-1",
+                importance=3,
+                source_chunk_ids=["c1"],
+                in_slides=True,
+                in_transcript=False,
+            )
+        ],
+        "transcript.vtt": [
+            _key_point(
+                "Gradient descent (lecture)",
+                id="kp-2",
+                importance=5,
+                summary="The lecturer's fuller explanation.",
+                source_chunk_ids=["c2"],
+                in_slides=False,
+                in_transcript=True,
+            )
+        ],
+    }
+    response = compact_merge_response(
+        [{"ids": ["p1", "p2"], "tier": "A", "title": "Gradient descent (merged)"}]
+    )
+    client = FakeClient(parse_responses=[response])
+
+    ranked = merge_and_rank(points_by_source, client=client, settings=_agentaus_settings())
+
+    assert len(ranked) == 1
+    merged = ranked[0]
+    assert merged.id == "kp-1"
+    assert merged.rank == 1
+    assert merged.tier == "A"
+    assert merged.title == "Gradient descent (merged)"
+    # Highest-importance member ("kp-2") is the base for summary/kind/evidence.
+    assert merged.summary == "The lecturer's fuller explanation."
+    assert merged.importance == 5
+    assert merged.in_slides is True
+    assert merged.in_transcript is True
+    assert merged.source_chunk_ids == ["c1", "c2"]
+
+
+def test_compact_merge_keeps_base_title_when_model_omits_one() -> None:
+    points_by_source = {"a.pdf": [_key_point("Alpha", id="kp-1", source_chunk_ids=["c1"])]}
+    response = compact_merge_response([{"ids": ["p1"], "tier": "B"}])  # no "title"
+    client = FakeClient(parse_responses=[response])
+
+    ranked = merge_and_rank(points_by_source, client=client, settings=_agentaus_settings())
+
+    assert ranked[0].title == "Alpha"
+    assert ranked[0].tier == "B"
+
+
+def test_compact_merge_appends_ids_the_model_omitted() -> None:
+    """An id the model never mentions is appended afterwards, ordered and
+    tiered by `_fallback_rank`, so nothing extracted is silently dropped.
+    """
+    points_by_source = {
+        "a.pdf": [
+            _key_point("Alpha", id="kp-1", importance=5, source_chunk_ids=["c1"]),
+            _key_point("Beta", id="kp-2", importance=1, source_chunk_ids=["c2"]),
+        ]
+    }
+    # The model only groups p1 ("Alpha"); p2 ("Beta") is never mentioned.
+    response = compact_merge_response([{"ids": ["p1"], "tier": "A"}])
+    client = FakeClient(parse_responses=[response])
+
+    ranked = merge_and_rank(points_by_source, client=client, settings=_agentaus_settings())
+
+    assert [p.title for p in ranked] == ["Alpha", "Beta"]
+    assert ranked[0].rank == 1
+    assert ranked[1].rank == 2
+    # Appended via _fallback_rank on the single remaining point -> tier A
+    # (round(1 * 0.3) == 0, so index 0 of 1 point falls in the B slice)...
+    # what matters here is just that it's present, tiered deterministically,
+    # and not lost.
+    fallback = _fallback_rank([points_by_source["a.pdf"][1]])
+    assert ranked[1].tier == fallback[0].tier
+
+
+def test_compact_merge_duplicate_id_first_group_wins() -> None:
+    points_by_source = {
+        "a.pdf": [
+            _key_point("Alpha", id="kp-1", importance=5, source_chunk_ids=["c1"]),
+            _key_point("Beta", id="kp-2", importance=1, source_chunk_ids=["c2"]),
+        ]
+    }
+    # "p1" appears in both groups; the second group's claim on it is ignored.
+    response = compact_merge_response(
+        [
+            {"ids": ["p1"], "tier": "A"},
+            {"ids": ["p1", "p2"], "tier": "C"},
+        ]
+    )
+    client = FakeClient(parse_responses=[response])
+
+    ranked = merge_and_rank(points_by_source, client=client, settings=_agentaus_settings())
+
+    assert len(ranked) == 2
+    assert ranked[0].title == "Alpha"
+    assert ranked[0].tier == "A"
+    # Second group kept only "p2" once "p1" was already claimed.
+    assert ranked[1].title == "Beta"
+    assert ranked[1].tier == "C"
+    assert ranked[1].source_chunk_ids == ["c2"]
+
+
+def test_compact_merge_ignores_unknown_ids() -> None:
+    points_by_source = {"a.pdf": [_key_point("Alpha", id="kp-1", source_chunk_ids=["c1"])]}
+    response = compact_merge_response([{"ids": ["p1", "p99", "bogus"], "tier": "A"}])
+    client = FakeClient(parse_responses=[response])
+
+    ranked = merge_and_rank(points_by_source, client=client, settings=_agentaus_settings())
+
+    assert len(ranked) == 1
+    assert ranked[0].title == "Alpha"
+
+
+def test_compact_merge_group_of_only_unknown_ids_is_dropped_not_empty() -> None:
+    points_by_source = {"a.pdf": [_key_point("Alpha", id="kp-1", source_chunk_ids=["c1"])]}
+    response = compact_merge_response(
+        [
+            {"ids": ["bogus"], "tier": "A"},
+            {"ids": ["p1"], "tier": "B"},
+        ]
+    )
+    client = FakeClient(parse_responses=[response])
+
+    ranked = merge_and_rank(points_by_source, client=client, settings=_agentaus_settings())
+
+    # The all-unknown group contributes no ranked point at all.
+    assert len(ranked) == 1
+    assert ranked[0].title == "Alpha"
+    assert ranked[0].tier == "B"
+
+
+def test_compact_merge_invalid_json_twice_falls_back_deterministically() -> None:
+    points_by_source = {
+        "a.pdf": [
+            _key_point("Alpha", id="kp-1", importance=5, source_chunk_ids=["c1"]),
+            _key_point("Beta", id="kp-2", importance=1, source_chunk_ids=["c2"]),
+        ]
+    }
+    bad1 = FakeParseResponse(parsed_output=None)
+    bad2 = FakeParseResponse(parsed_output=None)
+    client = FakeClient(parse_responses=[bad1, bad2])
+
+    ranked = merge_and_rank(points_by_source, client=client, settings=_agentaus_settings())
+
+    assert len(client.messages.parse_calls) == 2
+    assert len(ranked) == 2
+    # Deterministic fallback: importance desc.
+    assert ranked[0].title == "Alpha"
+    assert ranked[1].title == "Beta"
+
+
+def test_compact_merge_unions_chunk_ids_without_duplicates() -> None:
+    """Chunk ids are derived locally from the grouped points (never asked
+    of the model), unioned in first-seen order with no duplicates even
+    when two members share a chunk id.
+    """
+    points_by_source = {
+        "a.pdf": [
+            _key_point("Alpha", id="kp-1", importance=3, source_chunk_ids=["c1", "c2"]),
+            _key_point("Alpha (again)", id="kp-2", importance=5, source_chunk_ids=["c2", "c3"]),
+        ]
+    }
+    response = compact_merge_response([{"ids": ["p1", "p2"], "tier": "A"}])
+    client = FakeClient(parse_responses=[response])
+
+    ranked = merge_and_rank(points_by_source, client=client, settings=_agentaus_settings())
+
+    assert ranked[0].source_chunk_ids == ["c1", "c2", "c3"]
+
+
+def test_compact_merge_tracks_usage_and_cost() -> None:
+    settings = _agentaus_settings()
+    points_by_source = {"a.pdf": [_key_point("Alpha", id="kp-1", source_chunk_ids=["c1"])]}
+    response = compact_merge_response([{"ids": ["p1"], "tier": "A"}])
+    response.usage = FakeUsage(input_tokens=2000, output_tokens=500)
+    client = FakeClient(parse_responses=[response])
+
+    run = KeyPointRun()
+    merge_and_rank(points_by_source, client=client, settings=settings, usage=run)
+
+    assert run.calls == 1
+    assert run.input_tokens == 2000
+    assert run.output_tokens == 500
+    assert run.est_cost_usd > 0

@@ -485,6 +485,235 @@ def _merge_user_prompt(points_by_source: dict[str, list[KeyPoint]], focus: str |
     return f"{focus_line}\nExtracted key points by source:\n\n{json.dumps(payload, indent=2)}"
 
 
+# --- Compact merge path (AgentAUS) -----------------------------------------
+#
+# AgentAUS ignores `max_tokens` and self-limits replies to roughly 2,500
+# words (~6.7k tokens including hidden reasoning, in the longest response
+# observed), and doesn't reliably enforce JSON mode. The full merge prompt
+# above asks the model to re-emit every ranked point in full (title,
+# summary, kind, importance, evidence, chunk ids, flags, tier) -- for a
+# whole course (100-200 points) that's 10k+ output tokens, which AgentAUS
+# will truncate or shorten, silently falling back to `_fallback_rank` or
+# dropping points.
+#
+# The compact path instead numbers each input point ("p1".."pN") and asks
+# only for a list of {ids, tier, title} groups (~15 tokens/point), then
+# rebuilds the full `RankedKeyPoint`s locally from the already-known input
+# points. This is used whenever `settings.provider == "agentaus"`; the
+# Anthropic path above is untouched.
+
+
+class _CompactGroup(BaseModel):
+    ids: list[str] = Field(default_factory=list)
+    tier: Tier = "B"
+    title: str | None = None
+
+
+class _CompactMergeResult(BaseModel):
+    groups: list[_CompactGroup]
+
+
+_COMPACT_MERGE_SYSTEM = """You merge and rank key points extracted from a course's \
+slides and transcripts into one ranked list for an audio overview.
+
+Each point below is tagged with a short id (e.g. "p7"). Merge duplicates: when a \
+slide point and a transcript point describe the same idea, put both their ids in \
+ONE group.
+
+Assign each group a tier:
+- A: core ideas, anything emphasised or assessed, and prerequisites for later \
+topics. Must be covered in depth.
+- B: worth a brief mention.
+- C: minor or admin items. Admin items about assessment deadlines are tier B, \
+not C.
+
+Order the list of groups by importance, tier A first, most important first \
+overall (this is the rank order).
+
+Every input id must appear in EXACTLY ONE group: do not invent ids, do not omit \
+any of the ids given to you, and do not repeat one id in two different groups.
+
+Respond with ONLY a compact JSON object (no markdown fences, no commentary, and \
+NEVER repeat the points' own text back) matching this shape:
+{"groups": [{"ids": ["p3", "p17"], "tier": "A"|"B"|"C", "title": "<a short merged \
+title, only if better than either input point's own title -- otherwise omit \
+this key>"}]}"""
+
+
+def _compact_merge_user_prompt(
+    points_by_source: dict[str, list[KeyPoint]], labels: dict[str, str], focus: str | None
+) -> str:
+    focus_line = f"\nFocus for this overview: {focus}\n" if focus else ""
+    payload = {
+        source: [
+            {
+                "id": labels[p.id],
+                "title": p.title,
+                "summary": p.summary,
+                "kind": p.kind,
+                "importance": p.importance,
+                "evidence": p.evidence,
+                "source_chunk_ids": p.source_chunk_ids,
+                "in_slides": p.in_slides,
+                "in_transcript": p.in_transcript,
+            }
+            for p in points
+        ]
+        for source, points in points_by_source.items()
+    }
+    return (
+        f"{focus_line}\nExtracted key points by source, each tagged with a short "
+        f'id (e.g. "p7") -- use ONLY these ids in your answer:\n\n'
+        f"{json.dumps(payload, indent=2)}"
+    )
+
+
+def _merge_members(
+    members: list[KeyPoint], tier: Tier, model_title: str | None, all_chunk_ids: set[str]
+) -> dict[str, Any]:
+    """Merge one group's member points into the fields of a single ranked
+    point: the highest-importance member is the base (summary, kind,
+    evidence); chunk ids are unioned (filtered to known ids, first-seen
+    order); in_slides/in_transcript are OR'd; importance is the max.
+    """
+    base = max(members, key=lambda p: p.importance)
+    seen: set[str] = set()
+    chunk_ids: list[str] = []
+    for member in members:
+        for cid in member.source_chunk_ids:
+            if cid in all_chunk_ids and cid not in seen:
+                seen.add(cid)
+                chunk_ids.append(cid)
+    return {
+        "title": model_title or base.title,
+        "summary": base.summary,
+        "kind": base.kind,
+        "importance": max(member.importance for member in members),
+        "evidence": base.evidence,
+        "source_chunk_ids": chunk_ids,
+        "in_slides": any(member.in_slides for member in members),
+        "in_transcript": any(member.in_transcript for member in members),
+        "tier": tier,
+    }
+
+
+def _build_ranked_from_groups(
+    groups: list[_CompactGroup],
+    points_by_label: dict[str, KeyPoint],
+    all_points: list[KeyPoint],
+    all_chunk_ids: set[str],
+) -> list[RankedKeyPoint]:
+    """Turn the model's compact groups into `RankedKeyPoint`s, in the
+    model's own rank order. Unknown ids are ignored; an id repeated across
+    groups counts only for the first group that used it; any input point
+    the model never mentioned is appended afterwards, ordered/tiered by
+    `_fallback_rank` (so nothing extracted is silently lost).
+    """
+    used_ids: set[str] = set()
+    merged_items: list[dict[str, Any]] = []
+    for group in groups:
+        members: list[KeyPoint] = []
+        for label in group.ids:
+            point = points_by_label.get(label)
+            if point is None or point.id in used_ids:
+                continue
+            used_ids.add(point.id)
+            members.append(point)
+        if not members:
+            continue
+        merged_items.append(_merge_members(members, group.tier, group.title, all_chunk_ids))
+
+    remaining = [p for p in all_points if p.id not in used_ids]
+    for extra in _fallback_rank(remaining):
+        merged_items.append(
+            {
+                "title": extra.title,
+                "summary": extra.summary,
+                "kind": extra.kind,
+                "importance": extra.importance,
+                "evidence": extra.evidence,
+                "source_chunk_ids": [cid for cid in extra.source_chunk_ids if cid in all_chunk_ids],
+                "in_slides": extra.in_slides,
+                "in_transcript": extra.in_transcript,
+                "tier": extra.tier,
+            }
+        )
+
+    return [
+        RankedKeyPoint(id=f"kp-{i + 1}", rank=i + 1, **item) for i, item in enumerate(merged_items)
+    ]
+
+
+def _compact_merge_and_rank(
+    all_points: list[KeyPoint],
+    points_by_source: dict[str, list[KeyPoint]],
+    *,
+    client: anthropic.Anthropic,
+    settings: Settings,
+    focus: str | None,
+    usage: KeyPointRun | None,
+) -> list[RankedKeyPoint]:
+    labels = {p.id: f"p{i + 1}" for i, p in enumerate(all_points)}
+    points_by_label = {label: p for p, label in zip(all_points, labels.values(), strict=True)}
+    user_prompt = _compact_merge_user_prompt(points_by_source, labels, focus)
+    all_chunk_ids = {cid for p in all_points for cid in p.source_chunk_ids}
+
+    last_error: Exception | None = None
+    for attempt in range(2):
+        messages: list[dict[str, Any]] = [{"role": "user", "content": user_prompt}]
+        if attempt == 1 and last_error is not None:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "That response was invalid "
+                        f"({last_error}). Reply with ONLY the JSON object matching the schema."
+                    ),
+                }
+            )
+        try:
+            response = _invoke_with_retries(
+                client=client,
+                model=settings.script_model,
+                max_tokens=MERGE_MAX_TOKENS,
+                system=_COMPACT_MERGE_SYSTEM,
+                messages=messages,
+                parse_model=_CompactMergeResult,
+                effort="medium",
+                usage=usage,
+                settings=settings,
+            )
+        except anthropic.AnthropicError as exc:
+            raise map_anthropic_error(exc) from exc
+        parsed = getattr(response, "parsed_output", None)
+        if parsed is None:
+            last_error = ValueError("no parsed_output on response")
+            logger.warning("compact merge attempt %d returned no usable output", attempt + 1)
+            continue
+        try:
+            result = (
+                parsed
+                if isinstance(parsed, _CompactMergeResult)
+                else _CompactMergeResult.model_validate(parsed)
+            )
+        except ValidationError as exc:
+            last_error = exc
+            continue
+
+        ranked = _build_ranked_from_groups(
+            result.groups, points_by_label, all_points, all_chunk_ids
+        )
+        if ranked:
+            logger.debug("compact merge_and_rank succeeded on attempt %d", attempt + 1)
+            return ranked
+        last_error = ValueError("model returned zero ranked points")
+
+    logger.warning(
+        "compact merge_and_rank falling back to deterministic ranking after: %s", last_error
+    )
+    return _fallback_rank(all_points)
+
+
 def _fallback_rank(all_points: list[KeyPoint]) -> list[RankedKeyPoint]:
     """Deterministic fallback ranking: importance desc, both-sources first;
     top 30% -> A, next 40% -> B, rest -> C.
@@ -522,10 +751,20 @@ def merge_and_rank(
     One script_model (Sonnet 5, effort medium) call via `messages.parse`,
     with a deterministic fallback if the model's output fails validation
     twice.
+
+    For `settings.provider == "agentaus"`, this delegates to the compact
+    merge path (see the "Compact merge path" section above) instead of the
+    full-reemission prompt below -- AgentAUS truncates or drops points on
+    a whole-course merge otherwise. The Anthropic path is unchanged.
     """
     all_points = [p for points in points_by_source.values() for p in points]
     if not all_points:
         return []
+
+    if settings.provider == "agentaus":
+        return _compact_merge_and_rank(
+            all_points, points_by_source, client=client, settings=settings, focus=focus, usage=usage
+        )
 
     user_prompt = _merge_user_prompt(points_by_source, focus)
     all_chunk_ids = {cid for p in all_points for cid in p.source_chunk_ids}
