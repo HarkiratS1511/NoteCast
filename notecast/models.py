@@ -7,6 +7,7 @@ later phase (parsers, embedder, store, chat) can import them safely.
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -55,10 +56,17 @@ class Location(BaseModel):
     heading_path: list[str] = Field(default_factory=list)
     t_start: float | None = None
     t_end: float | None = None
+    # For transcripts without timestamps: an estimate of how far into the
+    # lecture this text starts, from word count at ~150 spoken words/minute.
+    approx_minute: float | None = None
+    speaker: str | None = None
+    # Character offsets into the parsed text of this section's source (optional).
+    char_start: int | None = None
+    char_end: int | None = None
 
     def label(self) -> str:
         """A short human-readable label, e.g. "p. 12", "slide 4",
-        "14:32-15:40", or a heading path — whichever parts are set.
+        "14:32-15:40", "≈ 23 min", or a heading path — whichever parts are set.
         """
         parts: list[str] = []
         if self.page is not None:
@@ -73,6 +81,8 @@ class Location(BaseModel):
                 parts.append(f"{start}–{_format_timestamp(self.t_end)}")
             else:
                 parts.append(start)
+        elif self.approx_minute is not None:
+            parts.append(f"≈ {int(self.approx_minute)} min")
         return ", ".join(parts)
 
 
@@ -145,3 +155,23 @@ class SearchFilters(BaseModel):
     weeks: list[int] | None = None
     source_types: list[SourceType] | None = None
     source_paths: list[str] | None = None
+
+
+class ManifestEntry(BaseModel):
+    """What we know about one ingested source file, so re-running ingest can
+    skip files whose content hasn't changed.
+    """
+
+    source_path: str
+    sha256: str
+    source_type: SourceType
+    title: str | None = None
+    chunk_count: int = 0
+    ingested_at: datetime
+
+
+class Manifest(BaseModel):
+    """The per-notebook record of ingested files, stored as manifest.json."""
+
+    version: int = 1
+    entries: dict[str, ManifestEntry] = Field(default_factory=dict)

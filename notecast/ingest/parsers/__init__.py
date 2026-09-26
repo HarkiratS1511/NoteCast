@@ -6,11 +6,19 @@ separate file without editing this one.
 
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 
 from notecast.interfaces import Parser
 
 _PARSERS: dict[str, Parser] = {}
+
+# Parser modules that register themselves on import (see load_builtin_parsers).
+BUILTIN_PARSER_MODULES = (
+    "notecast.ingest.parsers.pdf",
+    "notecast.ingest.parsers.office",
+    "notecast.ingest.parsers.transcripts",
+)
 
 
 class UnsupportedFileError(ValueError):
@@ -38,3 +46,9 @@ def get_parser(path: Path) -> Parser:
 def registered_suffixes() -> set[str]:
     """The set of extensions (e.g. {'.pdf', '.pptx'}) with a registered parser."""
     return set(_PARSERS.keys())
+
+
+def load_builtin_parsers() -> None:
+    """Import every built-in parser module so each one registers itself."""
+    for module in BUILTIN_PARSER_MODULES:
+        importlib.import_module(module)
