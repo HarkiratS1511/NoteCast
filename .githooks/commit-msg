@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Strip AI attribution trailers so history only shows the repo owner.
+set -euo pipefail
+msg_file="$1"
+tmp="$(mktemp)"
+grep -viE '^(Co-Authored-By:.*(Claude|anthropic)|Claude-Session:|.*Generated with \[?Claude Code)' "$msg_file" > "$tmp" || true
+# Drop trailing blank lines left behind.
+sed -e ':a' -e '/^\n*$/{$d;N;ba' -e '}' "$tmp" > "$msg_file"
+rm -f "$tmp"

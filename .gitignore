@@ -1,0 +1,54 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Secrets ---
+.env
+.env.*
+!.env.example
+
+# --- NoteCast data (your course material never goes to git) ---
+data/
+notebooks/*/
+!notebooks/.gitkeep
+*.lancedb/
+.lancedb/
+chroma/
+.cache/
+
+# --- Generated audio & models ---
+*.wav
+*.mp3
+*.m4a
+*.ogg
+models/
+*.onnx
+*.pt
+*.bin
+
+# --- Frontend (if we add one) ---
+node_modules/
+.next/
+.vite/
+
+# --- OS / editors ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# --- Claude Code local-only settings ---
+.claude/settings.local.json
