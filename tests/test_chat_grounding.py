@@ -6,7 +6,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from notecast.chat.grounding import hits_to_search_results, parse_response
+from notecast.chat.grounding import (
+    chunks_to_search_results,
+    hits_to_search_results,
+    parse_response,
+    sort_chunks_for_deep,
+)
 from notecast.chat.prompts import NOT_IN_SOURCES_TOKEN
 from notecast.models import Chunk, Location, SearchHit, SourceType
 
@@ -131,6 +136,43 @@ def test_prose_pdf_without_slide_location_split_by_sentences() -> None:
     )
     results = hits_to_search_results([SearchHit(chunk=chunk, score=1.0)])
     assert all("\n" not in block["text"] for block in results[0]["content"])
+
+
+def _course_chunk(
+    chunk_id: str, *, week: int | None, source_type: SourceType, source_path: str, ordinal: int = 0
+) -> Chunk:
+    return Chunk(
+        chunk_id=chunk_id,
+        course="comp4650",
+        source_path=source_path,
+        source_type=source_type,
+        ordinal=ordinal,
+        text="Some material.",
+        header=source_path,
+        week=week,
+    )
+
+
+def test_sort_chunks_for_deep_orders_by_week_then_type_then_source_then_ordinal() -> None:
+    chunks = [
+        _course_chunk("a", week=5, source_type=SourceType.PPTX, source_path="w5/a.pptx"),
+        _course_chunk("b", week=3, source_type=SourceType.VTT, source_path="w3/a.vtt"),
+        _course_chunk("c", week=3, source_type=SourceType.PDF, source_path="w3/a.pdf"),
+        _course_chunk("d", week=3, source_type=SourceType.PDF, source_path="w3/a.pdf", ordinal=1),
+        _course_chunk("e", week=None, source_type=SourceType.TXT, source_path="misc/notes.txt"),
+    ]
+    ordered = sort_chunks_for_deep(chunks)
+    assert [c.chunk_id for c in ordered] == ["c", "d", "b", "a", "e"]
+
+
+def test_chunks_to_search_results_preserves_given_order() -> None:
+    chunks = [
+        _course_chunk("first", week=1, source_type=SourceType.PDF, source_path="w1/a.pdf"),
+        _course_chunk("second", week=1, source_type=SourceType.VTT, source_path="w1/a.vtt"),
+    ]
+    results = chunks_to_search_results(chunks)
+    assert [r["source"] for r in results] == ["w1/a.pdf", "w1/a.vtt"]
+    assert all(r["citations"] == {"enabled": True} for r in results)
 
 
 def _dict_message(content: list[dict]) -> dict:

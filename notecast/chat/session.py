@@ -2,24 +2,37 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import anthropic
 
 from notecast.chat.client import ChatError, get_client, map_anthropic_error
-from notecast.chat.grounding import hits_to_search_results, parse_response
+from notecast.chat.grounding import (
+    chunks_to_search_results,
+    hits_to_search_results,
+    parse_response,
+    sort_chunks_for_deep,
+)
 from notecast.chat.models import AnswerSegment, ChatAnswer, ChatMode, Usage
 from notecast.chat.pricing import estimate_cost
 from notecast.chat.prompts import (
+    DEEP_SYSTEM_PROMPT,
     OPEN_SYSTEM_PROMPT,
     QUERY_REWRITE_PROMPT,
     SOURCES_ONLY_SYSTEM_PROMPT,
 )
 from notecast.config import Settings, get_settings
-from notecast.models import SearchFilters
+from notecast.ingest.textutils import estimate_tokens
+from notecast.models import Chunk, SearchFilters, SearchHit
 
 _MAX_PAUSE_CONTINUATIONS = 3
 _QUERY_REWRITE_MAX_TOKENS = 200
+# Deep mode: refuse to send material estimated over this many input tokens.
+_MAX_DEEP_TOKENS = 600_000
+# Rough per-chunk JSON overhead (title, source, block wrapper) added on top
+# of the chunk's own text when estimating deep mode's material size.
+_DEEP_OVERHEAD_TOKENS_PER_CHUNK = 20
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -40,16 +53,30 @@ class ChatSession:
         settings: Settings | None = None,
         client: anthropic.Anthropic | None = None,
         course_name: str = "",
+        chunk_source: Callable[[SearchFilters | None], list[Chunk]] | None = None,
     ) -> None:
         self.retriever = retriever
         self.settings = settings or get_settings()
         self.client = client or get_client(self.settings)
         self.course_name = course_name
+        # Deep mode needs every chunk in scope, not just top-k hits; the
+        # service layer passes e.g. `store.all_chunks`.
+        self.chunk_source = chunk_source
         self.history: list[tuple[str, str]] = []
+        self._last_mode: ChatMode | None = None
+        # The deep-mode "material" context currently attached to a turn in
+        # `self.history`: {"blocks": [...], "attach_at": <history index>}.
+        # Rebuilt from scratch whenever the mode or the deep scope changes
+        # (see `_ask_deep`).
+        self._deep_material: dict[str, Any] | None = None
+        self._deep_scope_key: tuple | None = None
 
     def reset(self) -> None:
-        """Clear conversation history."""
+        """Clear conversation history and any deep-mode material context."""
         self.history = []
+        self._last_mode = None
+        self._deep_material = None
+        self._deep_scope_key = None
 
     def ask(
         self,
@@ -62,6 +89,11 @@ class ChatSession:
         if not question or not question.strip():
             raise ValueError("Please type a question.")
 
+        if mode == "deep":
+            answer = self._ask_deep(question, filters)
+            self._last_mode = mode
+            return answer
+
         standalone_query = self._rewrite_query(question)
         k = k or self.settings.retrieval_top_k
         hits = self.retriever.search(standalone_query, k=k, filters=filters)
@@ -69,6 +101,7 @@ class ChatSession:
         if mode == "sources" and not hits:
             answer = self._not_in_sources_answer(question, standalone_query, mode)
             self.history.append((question, self._plain_text(answer)))
+            self._last_mode = mode
             return answer
 
         search_result_blocks = hits_to_search_results(hits)
@@ -107,6 +140,156 @@ class ChatSession:
             hits=hits,
             usage=usage,
             model=self.settings.chat_model,
+            stop_reason=_get(message, "stop_reason"),
+        )
+        self.history.append((question, self._plain_text(answer)))
+        self._last_mode = mode
+        return answer
+
+    # --- Deep mode -----------------------------------------------------
+
+    @staticmethod
+    def _filters_key(filters: SearchFilters | None) -> tuple:
+        """A hashable, order-independent signature for `filters`, so two
+        equivalent filter objects compare equal.
+        """
+        if filters is None:
+            return (None, None, None)
+        weeks = tuple(sorted(filters.weeks)) if filters.weeks else None
+        source_types = (
+            tuple(sorted(t.value for t in filters.source_types)) if filters.source_types else None
+        )
+        source_paths = tuple(sorted(filters.source_paths)) if filters.source_paths else None
+        return (weeks, source_types, source_paths)
+
+    def _estimate_material_tokens(self, chunks: list[Chunk]) -> int:
+        """Rough input-token estimate for sending `chunks` as deep mode's
+        search_result material (chunk text plus JSON/header overhead).
+        """
+        total = 0
+        for chunk in chunks:
+            total += estimate_tokens(chunk.text) + estimate_tokens(chunk.header or "")
+            total += _DEEP_OVERHEAD_TOKENS_PER_CHUNK
+        return total
+
+    def _deep_scope_chunks(self, filters: SearchFilters | None) -> tuple[list[Chunk], int]:
+        """Fetch and order the chunks in scope for deep mode, and estimate
+        their token size. Raises ChatError if there's no chunk source, or
+        the scope is too large to send.
+        """
+        if self.chunk_source is None:
+            raise ChatError("Deep mode needs the full index")
+        chunks = self.chunk_source(filters)
+        ordered = sort_chunks_for_deep(chunks)
+        if not ordered:
+            raise ChatError("Nothing in scope for deep mode — check the week filter")
+        tokens = self._estimate_material_tokens(ordered)
+        if tokens > _MAX_DEEP_TOKENS:
+            raise ChatError(
+                f"The material in scope is about {tokens:,} tokens, over deep mode's "
+                f"{_MAX_DEEP_TOKENS:,}-token limit. Narrow the scope (fewer weeks or "
+                "files) and try again."
+            )
+        return ordered, tokens
+
+    def estimate_deep_cost(self, filters: SearchFilters | None = None) -> tuple[int, float]:
+        """Estimate deep mode's material size and typical cost, so a caller
+        can show it before the user confirms sending it.
+
+        Returns (estimated_input_tokens, estimated_usd) where the USD figure
+        covers a first, uncached call (which pays the cache-write premium on
+        the material) plus one typical cached follow-up (which reads it back
+        cheaply). Raises ChatError if there's no chunk source, or the scope
+        is too large for deep mode.
+        """
+        _, tokens = self._deep_scope_chunks(filters)
+        model = self.settings.deep_model
+        first_call = estimate_cost(model, {"cache_write_tokens": tokens}) or 0.0
+        follow_up = estimate_cost(model, {"cache_read_tokens": tokens}) or 0.0
+        return tokens, first_call + follow_up
+
+    def _ask_deep(self, question: str, filters: SearchFilters | None) -> ChatAnswer:
+        """Deep mode: send every chunk in scope as search_result material,
+        instead of top-k retrieval.
+
+        The material is attached once, to whichever turn starts (or
+        restarts) the current "deep scope" — the first deep turn after a
+        mode switch or a change of `filters` — and resent identically on
+        every later turn in that same scope so it reads from cache. If the
+        mode or the scope changes, the material context is rebuilt fresh
+        and reattached to the new turn; earlier turns keep appearing as
+        plain-text history only (no material re-sent for them).
+
+        The ordered chunk list is kept alongside the material blocks so
+        citations can be mapped back: since only the current scope's
+        material is ever in the request, `search_result_index` 0..N-1
+        always lines up with that same chunk list, in the same order.
+        """
+        scope_key = self._filters_key(filters)
+        needs_fresh_material = (
+            self._deep_material is None
+            or self._last_mode != "deep"
+            or self._deep_scope_key != scope_key
+        )
+        if needs_fresh_material:
+            ordered_chunks, _tokens = self._deep_scope_chunks(filters)
+            material_blocks = chunks_to_search_results(ordered_chunks)
+            if material_blocks:
+                material_blocks[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}
+            self._deep_material = {
+                "blocks": material_blocks,
+                "chunks": ordered_chunks,
+                "attach_at": len(self.history),
+            }
+            self._deep_scope_key = scope_key
+
+        attach_at = self._deep_material["attach_at"]
+        material_blocks = self._deep_material["blocks"]
+        material_hits = [
+            SearchHit(chunk=chunk, score=1.0) for chunk in self._deep_material["chunks"]
+        ]
+
+        messages: list[dict] = []
+        for i, (prior_question, prior_answer) in enumerate(self.history):
+            if i == attach_at:
+                user_content: list[dict] = [
+                    *material_blocks,
+                    {"type": "text", "text": prior_question},
+                ]
+            else:
+                user_content = [{"type": "text", "text": prior_question}]
+            messages.append({"role": "user", "content": user_content})
+            messages.append(
+                {"role": "assistant", "content": [{"type": "text", "text": prior_answer}]}
+            )
+        if messages:
+            messages[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}
+
+        if attach_at == len(self.history):
+            new_content: list[dict] = [*material_blocks, {"type": "text", "text": question}]
+        else:
+            new_content = [{"type": "text", "text": question}]
+        messages.append({"role": "user", "content": new_content})
+
+        message, usage_totals = self._call_claude(
+            DEEP_SYSTEM_PROMPT, messages, tools=None, model=self.settings.deep_model
+        )
+
+        segments, citations, not_in_sources = parse_response(message, material_hits)
+
+        usage = Usage(**usage_totals)
+        usage.est_cost_usd = estimate_cost(self.settings.deep_model, usage_totals)
+
+        answer = ChatAnswer(
+            question=question,
+            standalone_query=question,
+            mode="deep",
+            segments=segments,
+            citations=citations,
+            not_in_sources=not_in_sources,
+            hits=material_hits,
+            usage=usage,
+            model=self.settings.deep_model,
             stop_reason=_get(message, "stop_reason"),
         )
         self.history.append((question, self._plain_text(answer)))
@@ -177,13 +360,18 @@ class ChatSession:
             return question
 
     def _call_claude(
-        self, system_prompt: str, messages: list[dict], tools: list[dict] | None
+        self,
+        system_prompt: str,
+        messages: list[dict],
+        tools: list[dict] | None,
+        *,
+        model: str | None = None,
     ) -> tuple[Any, dict]:
         """Call Claude, following `pause_turn` continuations (up to a limit)
         and mapping stop reasons. Returns (final_message, usage_totals).
         """
         kwargs: dict[str, Any] = {
-            "model": self.settings.chat_model,
+            "model": model or self.settings.chat_model,
             "max_tokens": self.settings.chat_max_tokens,
             "system": [
                 {

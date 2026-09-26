@@ -44,6 +44,19 @@ Rules:
   read as plain text).
 """
 
+_DEEP_MODE_ADDENDUM = """
+You have been given the ENTIRE course material in scope for this conversation, not just a
+handful of top search results — every relevant slide, document and transcript chunk in scope
+is included below. Because you have the complete picture, you can (and should) synthesise
+across multiple lectures and files: compare and contrast them, trace how a topic develops
+over the term, and list everything relevant to the question comprehensively rather than
+picking just one example.
+"""
+
+# Deep mode follows the same sources-only rules (only answer from what's provided, say so
+# plainly when it's missing), plus the note above that the full material is included.
+DEEP_SYSTEM_PROMPT = SOURCES_ONLY_SYSTEM_PROMPT + _DEEP_MODE_ADDENDUM
+
 QUERY_REWRITE_PROMPT = """You rewrite a student's follow-up chat message into a standalone
 search query, using the recent conversation history for context.
 

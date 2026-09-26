@@ -11,7 +11,7 @@ import pytest
 from notecast.chat.client import ChatError
 from notecast.chat.session import ChatSession
 from notecast.config import Settings
-from notecast.models import Chunk, Location, SearchHit, SourceType
+from notecast.models import Chunk, Location, SearchFilters, SearchHit, SourceType
 
 # --- Fakes -------------------------------------------------------------
 
@@ -78,6 +78,7 @@ def _settings(**overrides: Any) -> Settings:
         anthropic_api_key="sk-ant-test",
         chat_model="claude-sonnet-5",
         helper_model="claude-haiku-4-5",
+        deep_model="claude-sonnet-5",
         chat_effort="medium",
         chat_max_tokens=8000,
         web_search_max_uses=3,
@@ -85,6 +86,44 @@ def _settings(**overrides: Any) -> Settings:
     )
     defaults.update(overrides)
     return Settings(**defaults)
+
+
+class FakeChunkSource:
+    """A fake `chunk_source` callable: records the filters it was called
+    with and returns a fixed list of chunks regardless of them (tests that
+    care about filter behaviour pass different chunk lists per filter).
+    """
+
+    def __init__(self, chunks: list[Chunk]) -> None:
+        self.chunks = chunks
+        self.calls: list[SearchFilters | None] = []
+
+    def __call__(self, filters: SearchFilters | None) -> list[Chunk]:
+        self.calls.append(filters)
+        return self.chunks
+
+
+def _deep_chunk(
+    chunk_id: str,
+    *,
+    week: int,
+    source_type: SourceType,
+    source_path: str,
+    ordinal: int = 0,
+    text: str = "Some course material.",
+) -> Chunk:
+    location = Location(slide=1) if source_type == SourceType.PPTX else Location()
+    return Chunk(
+        chunk_id=chunk_id,
+        course="comp4650",
+        source_path=source_path,
+        source_type=source_type,
+        ordinal=ordinal,
+        text=text,
+        header=f"COMP4650 · Week {week} · {source_path}",
+        location=location,
+        week=week,
+    )
 
 
 def _hit(chunk_id: str = "c1") -> SearchHit:
@@ -389,3 +428,408 @@ def test_reset_clears_history() -> None:
     session.reset()
 
     assert session.history == []
+
+
+# --- Deep mode ---------------------------------------------------------
+
+
+def test_deep_sends_all_in_scope_chunks_in_course_order() -> None:
+    # Deliberately out of order: week 5 before week 3, transcript before
+    # slide within a week — deep mode must reorder them.
+    chunks = [
+        _deep_chunk("w5-slide", week=5, source_type=SourceType.PPTX, source_path="w5/a.pptx"),
+        _deep_chunk("w3-transcript", week=3, source_type=SourceType.VTT, source_path="w3/a.vtt"),
+        _deep_chunk("w3-slide", week=3, source_type=SourceType.PPTX, source_path="w3/a.pptx"),
+    ]
+    chunk_source = FakeChunkSource(chunks)
+    retriever = FakeRetriever([])
+    client = FakeClient(stream_responses=[_end_turn_message()])
+    session = ChatSession(retriever, settings=_settings(), client=client, chunk_source=chunk_source)
+
+    session.ask("Summarise the course.", mode="deep")
+
+    kwargs = client.messages.stream_calls[0]
+    material = kwargs["messages"][0]["content"][:-1]  # everything but the question block
+    sources_in_order = [block["source"] for block in material]
+    assert sources_in_order == ["w3/a.pptx", "w3/a.vtt", "w5/a.pptx"]
+    # Deep mode doesn't retrieve top-k at all.
+    assert retriever.calls == []
+
+
+def test_deep_uses_deep_model_and_sources_only_style_prompt_no_tools() -> None:
+    chunks = [_deep_chunk("c1", week=1, source_type=SourceType.PPTX, source_path="w1/a.pptx")]
+    chunk_source = FakeChunkSource(chunks)
+    client = FakeClient(stream_responses=[_end_turn_message()])
+    settings = _settings(deep_model="claude-opus-5")
+    session = ChatSession(
+        FakeRetriever([]), settings=settings, client=client, chunk_source=chunk_source
+    )
+
+    answer = session.ask("Compare weeks.", mode="deep")
+
+    kwargs = client.messages.stream_calls[0]
+    assert kwargs["model"] == "claude-opus-5"
+    assert "tools" not in kwargs
+    assert "complete" in kwargs["system"][0]["text"].lower() or (
+        "entire" in kwargs["system"][0]["text"].lower()
+    )
+    assert answer.model == "claude-opus-5"
+
+
+def test_deep_turn_one_has_cache_control_on_last_material_block() -> None:
+    chunks = [
+        _deep_chunk("c1", week=1, source_type=SourceType.PPTX, source_path="w1/a.pptx"),
+        _deep_chunk("c2", week=1, source_type=SourceType.PPTX, source_path="w1/b.pptx"),
+    ]
+    chunk_source = FakeChunkSource(chunks)
+    client = FakeClient(stream_responses=[_end_turn_message()])
+    session = ChatSession(
+        FakeRetriever([]), settings=_settings(), client=client, chunk_source=chunk_source
+    )
+
+    session.ask("question", mode="deep")
+
+    kwargs = client.messages.stream_calls[0]
+    messages = kwargs["messages"]
+    assert len(messages) == 1
+    content = messages[0]["content"]
+    material_blocks = content[:-1]
+    question_block = content[-1]
+    assert question_block == {"type": "text", "text": "question"}
+    # Only the very last material block carries the breakpoint.
+    for block in material_blocks[:-1]:
+        assert "cache_control" not in block["content"][-1]
+    assert material_blocks[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_deep_turn_two_resends_identical_material_then_new_question() -> None:
+    chunks = [_deep_chunk("c1", week=1, source_type=SourceType.PPTX, source_path="w1/a.pptx")]
+    chunk_source = FakeChunkSource(chunks)
+    client = FakeClient(
+        stream_responses=[_end_turn_message("First answer."), _end_turn_message("Second answer.")]
+    )
+    session = ChatSession(
+        FakeRetriever([]), settings=_settings(), client=client, chunk_source=chunk_source
+    )
+
+    session.ask("first question", mode="deep")
+    session.ask("second question", mode="deep")
+
+    assert len(client.messages.stream_calls) == 2
+    turn1_messages = client.messages.stream_calls[0]["messages"]
+    turn2_messages = client.messages.stream_calls[1]["messages"]
+
+    # Turn 1: a single user message = [material..., question].
+    turn1_material = turn1_messages[0]["content"][:-1]
+
+    # Turn 2: [user(material..., first question), assistant(first answer,
+    # cached), user(second question)].
+    assert len(turn2_messages) == 3
+    turn2_user_content = turn2_messages[0]["content"]
+    turn2_material = turn2_user_content[:-1]
+    turn2_question_block = turn2_user_content[-1]
+
+    assert turn2_material == turn1_material
+    assert turn2_question_block == {"type": "text", "text": "first question"}
+    # The material's breakpoint is still there.
+    assert turn2_material[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    # The history breakpoint rule still applies to the most recent turn.
+    assert turn2_messages[1]["role"] == "assistant"
+    assert turn2_messages[1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    # The new question is appended on its own, with no material duplicated.
+    assert turn2_messages[2] == {
+        "role": "user",
+        "content": [{"type": "text", "text": "second question"}],
+    }
+
+    # Only one chunk_source call was made — material was reused, not rebuilt.
+    assert len(chunk_source.calls) == 1
+
+
+def test_deep_respects_filters_passed_to_chunk_source() -> None:
+    chunks = [_deep_chunk("c1", week=3, source_type=SourceType.PPTX, source_path="w3/a.pptx")]
+    chunk_source = FakeChunkSource(chunks)
+    client = FakeClient(stream_responses=[_end_turn_message()])
+    session = ChatSession(
+        FakeRetriever([]), settings=_settings(), client=client, chunk_source=chunk_source
+    )
+    filters = SearchFilters(weeks=[3])
+
+    session.ask("question", mode="deep", filters=filters)
+
+    assert chunk_source.calls == [filters]
+
+
+def test_deep_without_chunk_source_raises_chat_error() -> None:
+    client = FakeClient(stream_responses=[])
+    session = ChatSession(FakeRetriever([]), settings=_settings(), client=client)
+
+    with pytest.raises(ChatError, match="Deep mode needs the full index"):
+        session.ask("question", mode="deep")
+
+    assert client.messages.stream_calls == []
+
+
+def test_deep_empty_scope_raises_chat_error_before_api_call() -> None:
+    chunk_source = FakeChunkSource([])
+    client = FakeClient(stream_responses=[])
+    session = ChatSession(
+        FakeRetriever([]), settings=_settings(), client=client, chunk_source=chunk_source
+    )
+
+    with pytest.raises(ChatError, match="Nothing in scope for deep mode — check the week filter"):
+        session.ask("question", mode="deep")
+
+    assert client.messages.stream_calls == []
+
+
+def test_estimate_deep_cost_empty_scope_raises() -> None:
+    chunk_source = FakeChunkSource([])
+    session = ChatSession(
+        FakeRetriever([]), settings=_settings(), client=FakeClient(), chunk_source=chunk_source
+    )
+
+    with pytest.raises(ChatError, match="Nothing in scope for deep mode"):
+        session.estimate_deep_cost()
+
+
+def test_estimate_deep_cost_returns_tokens_and_usd() -> None:
+    chunks = [
+        _deep_chunk(
+            "c1", week=1, source_type=SourceType.PPTX, source_path="w1/a.pptx", text="x" * 4000
+        )
+    ]
+    chunk_source = FakeChunkSource(chunks)
+    session = ChatSession(
+        FakeRetriever([]),
+        settings=_settings(deep_model="claude-sonnet-5"),
+        client=FakeClient(),
+        chunk_source=chunk_source,
+    )
+
+    tokens, cost = session.estimate_deep_cost()
+
+    assert tokens > 0
+    assert cost > 0
+    # A first, uncached call plus a cheap cached follow-up should cost less
+    # than sending the material twice at full price.
+    prices = 2.00  # claude-sonnet-5 input $/MTok, see notecast/chat/pricing.py
+    full_price_twice = 2 * tokens / 1_000_000 * prices
+    assert cost < full_price_twice
+
+
+def test_estimate_deep_cost_without_chunk_source_raises() -> None:
+    session = ChatSession(FakeRetriever([]), settings=_settings(), client=FakeClient())
+
+    with pytest.raises(ChatError, match="Deep mode needs the full index"):
+        session.estimate_deep_cost()
+
+
+def test_deep_refuses_when_estimated_tokens_too_large() -> None:
+    # ~4 chars/token estimate: 3M characters -> ~750k tokens, over the 600k limit.
+    huge_chunk = _deep_chunk(
+        "huge", week=1, source_type=SourceType.PPTX, source_path="w1/a.pptx", text="x" * 3_000_000
+    )
+    chunk_source = FakeChunkSource([huge_chunk])
+    client = FakeClient(stream_responses=[])
+    session = ChatSession(
+        FakeRetriever([]), settings=_settings(), client=client, chunk_source=chunk_source
+    )
+
+    with pytest.raises(ChatError, match="600,000-token limit|600000"):
+        session.ask("question", mode="deep")
+
+    assert client.messages.stream_calls == []
+
+
+def test_deep_estimate_cost_also_refuses_when_too_large() -> None:
+    huge_chunk = _deep_chunk(
+        "huge", week=1, source_type=SourceType.PPTX, source_path="w1/a.pptx", text="x" * 3_000_000
+    )
+    chunk_source = FakeChunkSource([huge_chunk])
+    session = ChatSession(
+        FakeRetriever([]), settings=_settings(), client=FakeClient(), chunk_source=chunk_source
+    )
+
+    with pytest.raises(ChatError):
+        session.estimate_deep_cost()
+
+
+def test_switching_from_sources_to_deep_starts_fresh_material_keeps_history() -> None:
+    chunks = [_deep_chunk("c1", week=1, source_type=SourceType.PPTX, source_path="w1/a.pptx")]
+    chunk_source = FakeChunkSource(chunks)
+    client = FakeClient(
+        stream_responses=[_end_turn_message("Sources answer."), _end_turn_message("Deep answer.")]
+    )
+    session = ChatSession(
+        FakeRetriever([_hit()]), settings=_settings(), client=client, chunk_source=chunk_source
+    )
+
+    session.ask("sources question", mode="sources")
+    session.ask("deep question", mode="deep")
+
+    deep_messages = client.messages.stream_calls[1]["messages"]
+    # Prior (sources-mode) turn appears as plain text only, no search_result
+    # blocks re-sent for it.
+    assert deep_messages[0] == {
+        "role": "user",
+        "content": [{"type": "text", "text": "sources question"}],
+    }
+    assert deep_messages[1]["role"] == "assistant"
+    # The new deep turn carries the fresh material.
+    deep_turn_content = deep_messages[2]["content"]
+    assert deep_turn_content[-1] == {"type": "text", "text": "deep question"}
+    assert deep_turn_content[0]["type"] == "search_result"
+
+
+def test_sources_and_open_modes_still_work_unchanged() -> None:
+    retriever = FakeRetriever([_hit()])
+    client = FakeClient(stream_responses=[_end_turn_message(), _end_turn_message()])
+    session = ChatSession(retriever, settings=_settings(), client=client)
+
+    sources_answer = session.ask("question one", mode="sources")
+    open_answer = session.ask("question two", mode="open")
+
+    assert sources_answer.mode == "sources"
+    assert open_answer.mode == "open"
+    assert len(client.messages.stream_calls) == 2
+
+
+# --- Deep mode citations (regression: search_result_index must map to the
+# ordered material chunks actually in the request, not an empty hit list) ---
+
+
+def _citing_message(text: str, *, search_result_index: int, cited_text: str) -> dict:
+    return {
+        "content": [
+            {
+                "type": "text",
+                "text": text,
+                "citations": [
+                    {
+                        "type": "search_result_location",
+                        "cited_text": cited_text,
+                        "source": "irrelevant",
+                        "title": "irrelevant",
+                        "search_result_index": search_result_index,
+                        "start_block_index": 0,
+                        "end_block_index": 1,
+                    }
+                ],
+            }
+        ],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 10,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        },
+    }
+
+
+def test_deep_turn_one_citations_map_to_correct_chunk() -> None:
+    # Sorted order (week 1, slide before transcript): chunk-a (pptx), then chunk-b (vtt).
+    chunks = [
+        _deep_chunk("chunk-a", week=1, source_type=SourceType.PPTX, source_path="w1/a.pptx"),
+        _deep_chunk("chunk-b", week=1, source_type=SourceType.VTT, source_path="w1/a.vtt"),
+    ]
+    chunk_source = FakeChunkSource(chunks)
+    message = _citing_message(
+        "As covered in the slides.", search_result_index=0, cited_text="Some course material."
+    )
+    client = FakeClient(stream_responses=[message])
+    session = ChatSession(
+        FakeRetriever([]), settings=_settings(), client=client, chunk_source=chunk_source
+    )
+
+    answer = session.ask("question", mode="deep")
+
+    assert len(answer.citations) == 1
+    assert answer.citations[0].chunk_id == "chunk-a"
+    assert answer.citations[0].source_path == "w1/a.pptx"
+    assert answer.segments[0].citation_numbers == [1]
+    assert answer.hits[0].chunk.chunk_id == "chunk-a"
+    assert answer.hits[1].chunk.chunk_id == "chunk-b"
+
+
+def test_deep_turn_two_same_scope_citations_still_map_correctly() -> None:
+    chunks = [
+        _deep_chunk("chunk-a", week=1, source_type=SourceType.PPTX, source_path="w1/a.pptx"),
+        _deep_chunk("chunk-b", week=1, source_type=SourceType.VTT, source_path="w1/a.vtt"),
+    ]
+    chunk_source = FakeChunkSource(chunks)
+    turn1 = _citing_message("First.", search_result_index=0, cited_text="Some course material.")
+    turn2 = _citing_message("Second.", search_result_index=1, cited_text="Some course material.")
+    client = FakeClient(stream_responses=[turn1, turn2])
+    session = ChatSession(
+        FakeRetriever([]), settings=_settings(), client=client, chunk_source=chunk_source
+    )
+
+    session.ask("first question", mode="deep")
+    answer2 = session.ask("second question", mode="deep")
+
+    assert len(answer2.citations) == 1
+    assert answer2.citations[0].chunk_id == "chunk-b"
+    assert answer2.citations[0].source_path == "w1/a.vtt"
+    assert answer2.segments[0].citation_numbers == [1]
+    # Material wasn't rebuilt for turn 2, but the hit list is still correct.
+    assert len(chunk_source.calls) == 1
+
+
+def test_switching_from_sources_to_deep_citations_map_to_deep_material() -> None:
+    chunks = [
+        _deep_chunk("chunk-a", week=1, source_type=SourceType.PPTX, source_path="w1/a.pptx"),
+        _deep_chunk("chunk-b", week=1, source_type=SourceType.VTT, source_path="w1/a.vtt"),
+    ]
+    chunk_source = FakeChunkSource(chunks)
+    sources_message = _end_turn_message("Sources answer.")
+    deep_message = _citing_message(
+        "Deep answer.", search_result_index=1, cited_text="Some course material."
+    )
+    client = FakeClient(stream_responses=[sources_message, deep_message])
+    session = ChatSession(
+        FakeRetriever([_hit()]), settings=_settings(), client=client, chunk_source=chunk_source
+    )
+
+    session.ask("sources question", mode="sources")
+    deep_answer = session.ask("deep question", mode="deep")
+
+    assert len(deep_answer.citations) == 1
+    assert deep_answer.citations[0].chunk_id == "chunk-b"
+    assert deep_answer.citations[0].source_path == "w1/a.vtt"
+
+
+def test_deep_scope_switch_citations_map_to_new_scope_not_old() -> None:
+    old_chunks = [
+        _deep_chunk("old-a", week=1, source_type=SourceType.PPTX, source_path="w1/a.pptx"),
+    ]
+    new_chunks = [
+        _deep_chunk("new-a", week=2, source_type=SourceType.PPTX, source_path="w2/a.pptx"),
+    ]
+    scoped_chunks = {
+        (None, None, None): old_chunks,
+    }
+
+    def chunk_source(filters: SearchFilters | None) -> list[Chunk]:
+        if filters is not None and filters.weeks == [2]:
+            return new_chunks
+        return scoped_chunks[(None, None, None)]
+
+    turn1 = _citing_message(
+        "About week 1.", search_result_index=0, cited_text="Some course material."
+    )
+    turn2 = _citing_message(
+        "About week 2.", search_result_index=0, cited_text="Some course material."
+    )
+    client = FakeClient(stream_responses=[turn1, turn2])
+    session = ChatSession(
+        FakeRetriever([]), settings=_settings(), client=client, chunk_source=chunk_source
+    )
+
+    answer1 = session.ask("question about week 1", mode="deep")
+    answer2 = session.ask("question about week 2", mode="deep", filters=SearchFilters(weeks=[2]))
+
+    assert answer1.citations[0].chunk_id == "old-a"
+    assert answer2.citations[0].chunk_id == "new-a"
+    assert answer2.citations[0].source_path == "w2/a.pptx"

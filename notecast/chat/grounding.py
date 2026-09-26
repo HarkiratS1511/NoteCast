@@ -11,10 +11,22 @@ from typing import Any
 
 from notecast.chat.models import AnswerSegment, Citation
 from notecast.chat.prompts import NOT_IN_SOURCES_TOKEN
-from notecast.models import SearchHit
+from notecast.models import Chunk, SearchHit
 
 _MAX_BLOCKS_PER_RESULT = 12
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+# Deep mode ordering: slide/page-style sources (PPTX, PDF, DOCX, TXT, MD) read
+# before flowing transcripts (VTT, SRT) within the same week.
+_DEEP_TYPE_RANK = {
+    "pptx": 0,
+    "pdf": 0,
+    "docx": 1,
+    "txt": 1,
+    "md": 1,
+    "vtt": 2,
+    "srt": 2,
+}
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -66,26 +78,49 @@ def _split_chunk_text(chunk: Any) -> list[str]:
     return _group_units(sentences, " ")
 
 
+def _chunk_to_search_result(chunk: Chunk) -> dict:
+    """Build one `search_result` content block for a single chunk."""
+    blocks = _split_chunk_text(chunk)
+    if not blocks:
+        blocks = [(chunk.text or "").strip()]
+    return {
+        "type": "search_result",
+        "source": chunk.source_path,
+        "title": chunk.header or chunk.source_path,
+        "content": [{"type": "text", "text": block} for block in blocks],
+        "citations": {"enabled": True},
+    }
+
+
 def hits_to_search_results(hits: list[SearchHit]) -> list[dict]:
     """Build one `search_result` content block per hit, ready to send in a
     user message's content list.
     """
-    results: list[dict] = []
-    for hit in hits:
-        chunk = hit.chunk
-        blocks = _split_chunk_text(chunk)
-        if not blocks:
-            blocks = [(chunk.text or "").strip()]
-        results.append(
-            {
-                "type": "search_result",
-                "source": chunk.source_path,
-                "title": chunk.header or chunk.source_path,
-                "content": [{"type": "text", "text": block} for block in blocks],
-                "citations": {"enabled": True},
-            }
-        )
-    return results
+    return [_chunk_to_search_result(hit.chunk) for hit in hits]
+
+
+def deep_sort_key(chunk: Chunk) -> tuple[int, int, str, int]:
+    """Sort key for deep mode's "whole course" material: by week, then
+    slide/page sources before transcripts, then source file, then ordinal.
+    """
+    week = chunk.week if chunk.week is not None else 10**9
+    rank = _DEEP_TYPE_RANK.get(chunk.source_type.value, 1)
+    return (week, rank, chunk.source_path, chunk.ordinal)
+
+
+def sort_chunks_for_deep(chunks: list[Chunk]) -> list[Chunk]:
+    """Order chunks the way deep mode presents them to Claude: by week,
+    slide/page material before transcripts, then deterministically by
+    source file and ordinal.
+    """
+    return sorted(chunks, key=deep_sort_key)
+
+
+def chunks_to_search_results(chunks: list[Chunk]) -> list[dict]:
+    """Build one `search_result` content block per chunk, in the order
+    given (see `sort_chunks_for_deep` for deep mode's ordering).
+    """
+    return [_chunk_to_search_result(chunk) for chunk in chunks]
 
 
 def parse_response(

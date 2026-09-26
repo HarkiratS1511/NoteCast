@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from notecast.models import SearchHit
 
-ChatMode = Literal["sources", "open"]
+ChatMode = Literal["sources", "open", "deep"]
 
 
 class Citation(BaseModel):
