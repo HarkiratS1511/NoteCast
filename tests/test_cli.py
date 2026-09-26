@@ -280,18 +280,32 @@ def _fake_answer(
     )
 
 
+class _FakeDeepSettings:
+    deep_model = "claude-sonnet-5"
+
+
 class FakeChatSession:
     """Replaces `notecast.chat.session.ChatSession` in CLI tests: returns a
     scripted sequence of `ChatAnswer`s and records how it was called.
     """
 
-    def __init__(self, answers: list) -> None:
+    def __init__(self, answers: list, *, deep_tokens: int = 1000, deep_cost: float = 0.01) -> None:
         self._answers = list(answers)
         self.calls: list[dict] = []
         self.reset_calls = 0
+        self.settings = _FakeDeepSettings()
+        self._deep_tokens = deep_tokens
+        self._deep_cost = deep_cost
+        self.estimate_deep_cost_calls = 0
 
-    def __call__(self, retriever, *, settings=None, client=None, course_name=""):  # noqa: ANN001
+    def __call__(  # noqa: ANN001
+        self, retriever, *, settings=None, client=None, course_name="", chunk_source=None
+    ):
         return self
+
+    def estimate_deep_cost(self, filters=None):  # noqa: ANN001
+        self.estimate_deep_cost_calls += 1
+        return self._deep_tokens, self._deep_cost
 
     def ask(self, question, *, mode="sources", filters=None, k=None):  # noqa: ANN001
         self.calls.append({"question": question, "mode": mode, "filters": filters, "k": k})
@@ -299,6 +313,90 @@ class FakeChatSession:
 
     def reset(self) -> None:
         self.reset_calls += 1
+
+
+def test_filter_chunks_applies_week_source_type_and_path_filters() -> None:
+    from notecast.cli import _filter_chunks
+    from notecast.models import Chunk, Location, SearchFilters, SourceType
+
+    def _c(source_path: str, week: int, source_type: SourceType, chunk_id: str) -> Chunk:
+        return Chunk(
+            chunk_id=chunk_id,
+            course="c",
+            source_path=source_path,
+            source_type=source_type,
+            ordinal=0,
+            text="x",
+            location=Location(),
+            week=week,
+        )
+
+    chunks = [
+        _c("a.txt", 1, SourceType.TXT, "c1"),
+        _c("b.pdf", 2, SourceType.PDF, "c2"),
+        _c("c.txt", 1, SourceType.TXT, "c3"),
+    ]
+
+    assert _filter_chunks(chunks, None) == chunks
+    assert [c.chunk_id for c in _filter_chunks(chunks, SearchFilters(weeks=[1]))] == ["c1", "c3"]
+    assert [
+        c.chunk_id for c in _filter_chunks(chunks, SearchFilters(source_types=[SourceType.PDF]))
+    ] == ["c2"]
+    assert [c.chunk_id for c in _filter_chunks(chunks, SearchFilters(source_paths=["a.txt"]))] == [
+        "c1"
+    ]
+
+
+def test_make_chat_session_wires_chunk_source(
+    tmp_notebooks_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import notecast.cli as cli_mod
+    from notecast.models import Chunk, Location, SearchFilters, SourceType
+
+    notebook = Notebook.create("my-course", root=tmp_notebooks_root)
+
+    chunks = [
+        Chunk(
+            chunk_id="c1",
+            course="c",
+            source_path="a.txt",
+            source_type=SourceType.TXT,
+            ordinal=0,
+            text="x",
+            location=Location(),
+            week=1,
+        ),
+        Chunk(
+            chunk_id="c2",
+            course="c",
+            source_path="b.txt",
+            source_type=SourceType.TXT,
+            ordinal=0,
+            text="y",
+            location=Location(),
+            week=2,
+        ),
+    ]
+
+    class FakeStore:
+        def all_chunks(self) -> list[Chunk]:
+            return chunks
+
+    class FakeRetriever:
+        store = FakeStore()
+
+    captured: dict = {}
+
+    def _fake_chat_session_cls(retriever, *, course_name="", chunk_source=None):  # noqa: ANN001
+        captured["chunk_source"] = chunk_source
+        return object()
+
+    monkeypatch.setattr(cli_mod, "ChatSession", _fake_chat_session_cls)
+
+    cli_mod._make_chat_session(notebook, FakeRetriever())
+
+    result = captured["chunk_source"](SearchFilters(weeks=[2]))
+    assert [c.chunk_id for c in result] == ["c2"]
 
 
 def test_ask_prints_markers_sources_and_cost_footer(
@@ -387,6 +485,89 @@ def test_chat_repl_mode_switch_and_quit(
     assert fake_session.calls[1]["mode"] == "open"
 
 
+def test_ask_deep_mode_prints_estimate_and_confirms(
+    tmp_notebooks_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import notecast.cli as cli_mod
+
+    _indexed_notebook(tmp_notebooks_root)
+    answer = _fake_answer([("Deep answer.", [])])
+    fake_session = FakeChatSession([answer], deep_tokens=12345, deep_cost=0.03)
+    monkeypatch.setattr(cli_mod, "ChatSession", fake_session)
+
+    result = runner.invoke(
+        app, ["ask", "my-course", "explain everything", "--mode", "deep"], input="y\n"
+    )
+
+    assert result.exit_code == 0
+    assert "Deep mode will send ~12,345 tokens" in result.output
+    assert "first question" in result.output
+    assert "per follow-up" in result.output
+    assert "Deep answer." in result.output
+    assert fake_session.estimate_deep_cost_calls == 1
+
+
+def test_ask_deep_mode_declined_exits_nonzero(
+    tmp_notebooks_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import notecast.cli as cli_mod
+
+    _indexed_notebook(tmp_notebooks_root)
+    fake_session = FakeChatSession([])
+    monkeypatch.setattr(cli_mod, "ChatSession", fake_session)
+
+    result = runner.invoke(
+        app, ["ask", "my-course", "explain everything", "--mode", "deep"], input="n\n"
+    )
+
+    assert result.exit_code == 1
+    assert fake_session.calls == []
+
+
+def test_ask_deep_mode_yes_skips_confirmation(
+    tmp_notebooks_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import notecast.cli as cli_mod
+
+    _indexed_notebook(tmp_notebooks_root)
+    answer = _fake_answer([("Deep answer.", [])])
+    fake_session = FakeChatSession([answer])
+    monkeypatch.setattr(cli_mod, "ChatSession", fake_session)
+
+    result = runner.invoke(
+        app, ["ask", "my-course", "explain everything", "--mode", "deep", "--yes"]
+    )
+
+    assert result.exit_code == 0
+    assert "Deep answer." in result.output
+
+
+def test_chat_deep_mode_estimate_shown_once(
+    tmp_notebooks_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import notecast.cli as cli_mod
+
+    _indexed_notebook(tmp_notebooks_root)
+    answers = [
+        _fake_answer([("Deep one.", [])]),
+        _fake_answer([("Deep two.", [])]),
+    ]
+    fake_session = FakeChatSession(answers, deep_tokens=5000, deep_cost=0.02)
+    monkeypatch.setattr(cli_mod, "ChatSession", fake_session)
+
+    result = runner.invoke(
+        app,
+        ["chat", "my-course", "--mode", "deep"],
+        input="q1\ny\nq2\n/quit\n",
+    )
+
+    assert result.exit_code == 0
+    assert "Deep one." in result.output
+    assert "Deep two." in result.output
+    assert result.output.count("Deep mode will send") == 1
+    assert fake_session.estimate_deep_cost_calls == 1
+
+
 # --- audio -------------------------------------------------------------
 
 
@@ -452,6 +633,22 @@ def _fake_overview_result(notebook: Notebook, *, render: bool):
     )
 
 
+def _fake_estimate(**overrides):
+    from notecast.audio.service import OverviewEstimate
+
+    defaults = dict(
+        total_material_tokens=5000,
+        n_sources=1,
+        n_chapters_low=3,
+        n_chapters_high=5,
+        est_cost_usd=0.1,
+        est_cost_low_usd=0.05,
+        est_cost_high_usd=0.15,
+    )
+    defaults.update(overrides)
+    return OverviewEstimate(**defaults)
+
+
 def test_audio_script_only_prints_plan_summary(
     tmp_notebooks_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -459,6 +656,10 @@ def test_audio_script_only_prints_plan_summary(
 
     notebook = Notebook.create("my-course", root=tmp_notebooks_root)
     result_obj = _fake_overview_result(notebook, render=False)
+
+    monkeypatch.setattr(
+        cli_mod, "estimate_overview_cost", lambda nb, scope, settings: _fake_estimate()
+    )
 
     def _fake_generate_overview(nb, scope, *, settings=None, render=True, progress=None, **kw):  # noqa: ANN001
         if progress is not None:
@@ -473,14 +674,36 @@ def test_audio_script_only_prints_plan_summary(
 
     monkeypatch.setattr(cli_mod, "render_saved_script", _boom_render)
 
-    result = runner.invoke(app, ["audio", "my-course", "--week", "1", "--script-only"])
+    result = runner.invoke(app, ["audio", "my-course", "--week", "1", "--script-only", "--yes"])
 
     assert result.exit_code == 0
+    assert "Estimated cost: ~$0.1000 (range $0.0500" in result.output
     assert "My Course — Week 1" in result.output
     assert "Target length: 6.0 min, 1 chapters" in result.output
     assert "Tier A points: 1, Tier B points: 0" in result.output
     assert "Estimated API cost: $0.0500" in result.output
     assert str(result_obj.script_json_path) in result.output
+
+
+def test_audio_requires_confirmation_without_yes(
+    tmp_notebooks_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import notecast.cli as cli_mod
+
+    Notebook.create("my-course", root=tmp_notebooks_root)
+    monkeypatch.setattr(
+        cli_mod, "estimate_overview_cost", lambda nb, scope, settings: _fake_estimate()
+    )
+
+    def _boom(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        raise AssertionError("generate_overview should not run if the user declines")
+
+    monkeypatch.setattr(cli_mod, "generate_overview", _boom)
+
+    result = runner.invoke(app, ["audio", "my-course", "--week", "1", "--script-only"], input="n\n")
+
+    assert result.exit_code == 1
+    assert "Cancelled." in result.output
 
 
 def test_audio_empty_scope_friendly_error(
@@ -493,7 +716,7 @@ def test_audio_empty_scope_friendly_error(
     def _raise_empty(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
         raise ValueError("No material in Week 9 — check the week numbers or run ingest")
 
-    monkeypatch.setattr(cli_mod, "generate_overview", _raise_empty)
+    monkeypatch.setattr(cli_mod, "estimate_overview_cost", _raise_empty)
 
     result = runner.invoke(app, ["audio", "my-course", "--week", "9", "--script-only"])
 
@@ -501,14 +724,70 @@ def test_audio_empty_scope_friendly_error(
     assert "No material in Week 9" in result.output
 
 
+def test_audio_failure_after_spend_reports_cost_and_stage(
+    tmp_notebooks_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import notecast.cli as cli_mod
+    from notecast.audio.service import OverviewFailed
+
+    Notebook.create("my-course", root=tmp_notebooks_root)
+    monkeypatch.setattr(
+        cli_mod, "estimate_overview_cost", lambda nb, scope, settings: _fake_estimate()
+    )
+
+    def _raise_failed(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        raise OverviewFailed("scripting", 0.1234, "boom while scripting")
+
+    monkeypatch.setattr(cli_mod, "generate_overview", _raise_failed)
+
+    result = runner.invoke(app, ["audio", "my-course", "--week", "1", "--script-only", "--yes"])
+
+    assert result.exit_code == 1
+    assert "failed at scripting" in result.output
+    assert "boom while scripting" in result.output
+    assert "spent ~$0.1234" in result.output
+
+
+def _write_minimal_script(path: Path) -> None:
+    from notecast.audio.models import (
+        AudioPlan,
+        AudioScope,
+        AudioScript,
+        ChapterPlan,
+        ChapterScript,
+        ScriptLine,
+    )
+
+    plan = AudioPlan(
+        scope=AudioScope(weeks=[1]),
+        points=[],
+        target_minutes=3.0,
+        target_words=450,
+        chapters=[ChapterPlan(index=1, title="Intro", point_ids=[], target_words=450)],
+    )
+    script = AudioScript(
+        title="My Course — Week 1",
+        plan=plan,
+        chapters=[
+            ChapterScript(
+                index=1,
+                title="Intro",
+                lines=[ScriptLine(speaker="A", text="Hello.", source_chunk_ids=["c1"])],
+            )
+        ],
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(script.model_dump_json(), encoding="utf-8")
+
+
 def test_audio_render_command(tmp_notebooks_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import notecast.cli as cli_mod
     from notecast.audio.models import RenderedChapter, RenderResult
+    from notecast.audio.service import RenderSavedResult
 
     notebook = Notebook.create("my-course", root=tmp_notebooks_root)
     script_json_path = notebook.audio_dir / "week-1.script.json"
-    script_json_path.parent.mkdir(parents=True, exist_ok=True)
-    script_json_path.write_text("{}", encoding="utf-8")
+    _write_minimal_script(script_json_path)
 
     mp3_path = notebook.audio_dir / "week-1.mp3"
     transcript_path = notebook.audio_dir / "week-1.md"
@@ -519,20 +798,24 @@ def test_audio_render_command(tmp_notebooks_root: Path, monkeypatch: pytest.Monk
         assert path == script_json_path
         if progress is not None:
             progress("rendering", 1.0)
-        return RenderResult(
+        render_result = RenderResult(
             mp3_path=mp3_path,
             transcript_path=transcript_path,
             duration_seconds=10.0,
             chapters=[RenderedChapter(index=1, title="Intro", start_seconds=0.0)],
         )
+        return RenderSavedResult(render=render_result, stale_chunk_ids=["c1"])
 
     monkeypatch.setattr(cli_mod, "render_saved_script", _fake_render_saved_script)
 
     result = runner.invoke(app, ["audio-render", "my-course", str(script_json_path)])
 
     assert result.exit_code == 0
+    assert "Estimated render time" in result.output
     assert str(mp3_path) in result.output
     assert str(transcript_path) in result.output
+    assert "no longer in the current index" in result.output
+    assert "1 cited chunk(s)" in result.output
 
 
 def test_audio_render_missing_script_file(tmp_notebooks_root: Path) -> None:

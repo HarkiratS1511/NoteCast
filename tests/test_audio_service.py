@@ -292,9 +292,10 @@ def test_script_json_saved_and_render_saved_script_skips_pipeline(
         pipeline.write_calls,
     )
 
-    render_result = render_saved_script(notebook, result.script_json_path)
+    saved = render_saved_script(notebook, result.script_json_path)
 
-    assert render_result.mp3_path.exists()
+    assert saved.render.mp3_path.exists()
+    assert saved.stale_chunk_ids == []
     assert pipeline.render_calls == 1
     assert (
         pipeline.extract_calls,
@@ -320,3 +321,122 @@ def test_cost_is_summed_from_key_points_and_script(
         estimate_cost("claude-haiku-4-5", {"input_tokens": 100, "output_tokens": 50}) or 0.0
     ) + (estimate_cost("claude-sonnet-5", {"input_tokens": 200, "output_tokens": 100}) or 0.0)
     assert result.est_cost_usd == pytest.approx(expected_kp_cost + 0.02)
+
+
+# --- estimate_overview_cost ---------------------------------------------
+
+
+def test_estimate_overview_cost_returns_a_range(
+    notebook: Notebook, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_retriever(monkeypatch, _sample_chunks())
+    scope = AudioScope(weeks=[1, 2])
+
+    estimate = service.estimate_overview_cost(notebook, scope)
+
+    assert estimate.n_sources == 2
+    assert estimate.total_material_tokens > 0
+    assert 0 < estimate.est_cost_low_usd <= estimate.est_cost_usd <= estimate.est_cost_high_usd
+    assert estimate.n_chapters_low >= 3
+    assert estimate.n_chapters_high <= 8
+    assert estimate.n_chapters_low <= estimate.n_chapters_high
+
+
+def test_estimate_overview_cost_empty_scope_raises(
+    notebook: Notebook, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_retriever(monkeypatch, _sample_chunks())
+    scope = AudioScope(weeks=[99])
+
+    with pytest.raises(ValueError, match="No material in"):
+        service.estimate_overview_cost(notebook, scope)
+
+
+def test_estimate_overview_cost_makes_no_api_calls(
+    notebook: Notebook, pipeline: FakePipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_retriever(monkeypatch, _sample_chunks())
+    scope = AudioScope(weeks=[1])
+
+    service.estimate_overview_cost(notebook, scope)
+
+    assert pipeline.extract_calls == 0
+    assert pipeline.merge_calls == 0
+    assert pipeline.plan_calls == 0
+    assert pipeline.write_calls == 0
+    assert pipeline.render_calls == 0
+
+
+# --- OverviewFailed (cost-on-failure) ------------------------------------
+
+
+def test_generate_overview_wraps_failure_with_spend_so_far(
+    notebook: Notebook, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_retriever(monkeypatch, _sample_chunks())
+    scope = AudioScope(weeks=[1])
+
+    def _spendy_extract(source_path, chunks, *, client, settings, focus=None, usage=None):  # noqa: ANN001
+        if usage is not None:
+            usage.add("claude-haiku-4-5", {"input_tokens": 1000, "output_tokens": 200})
+        raise service.ChatError("boom during extraction")
+
+    monkeypatch.setattr(service, "extract_key_points", _spendy_extract)
+
+    with pytest.raises(service.OverviewFailed) as exc_info:
+        generate_overview(notebook, scope, client=object(), render=False)
+
+    err = exc_info.value
+    assert err.stage == "key_points"
+    assert err.est_cost_usd > 0
+    assert "boom during extraction" in str(err)
+
+
+def test_generate_overview_failure_before_any_spend_is_not_wrapped(
+    notebook: Notebook, pipeline: FakePipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An empty scope fails before any API call is made, so it's a plain
+    # ValueError, not an OverviewFailed.
+    _patch_retriever(monkeypatch, _sample_chunks())
+    scope = AudioScope(weeks=[99])
+
+    with pytest.raises(ValueError) as exc_info:
+        generate_overview(notebook, scope, client=object(), render=False)
+
+    assert not isinstance(exc_info.value, service.OverviewFailed)
+
+
+# --- Timestamped script filenames ----------------------------------------
+
+
+def test_script_json_filename_includes_timestamp(
+    notebook: Notebook, pipeline: FakePipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import re
+
+    _patch_retriever(monkeypatch, _sample_chunks())
+    scope = AudioScope(weeks=[1])
+
+    result = generate_overview(notebook, scope, client=object(), render=False)
+
+    assert re.search(r"-\d{8}-\d{4}\.script\.json$", result.script_json_path.name)
+
+
+# --- Stale chunk detection in render_saved_script -------------------------
+
+
+def test_render_saved_script_reports_stale_chunk_ids(
+    notebook: Notebook, pipeline: FakePipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chunks = _sample_chunks()
+    _patch_retriever(monkeypatch, chunks)
+    scope = AudioScope(weeks=[1])
+
+    result = generate_overview(notebook, scope, client=object(), render=False)
+
+    # Re-ingest: the chunk the fake script cited ("c1") is now gone.
+    _patch_retriever(monkeypatch, [c for c in chunks if c.chunk_id != "c1"])
+
+    saved = render_saved_script(notebook, result.script_json_path)
+
+    assert saved.stale_chunk_ids == ["c1"]

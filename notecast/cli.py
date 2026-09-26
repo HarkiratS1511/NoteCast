@@ -13,10 +13,16 @@ import typer
 from notecast import __version__
 from notecast.audio.models import AudioScope, AudioScript
 from notecast.audio.render import estimate_render_seconds
-from notecast.audio.service import generate_overview, render_saved_script
+from notecast.audio.service import (
+    OverviewFailed,
+    estimate_overview_cost,
+    generate_overview,
+    render_saved_script,
+)
 from notecast.audio.tts import InvalidVoiceError, TTSUnavailableError
 from notecast.chat.client import ChatError, MissingApiKeyError
 from notecast.chat.models import ChatAnswer, ChatMode
+from notecast.chat.pricing import estimate_cost as estimate_api_cost
 from notecast.chat.session import ChatSession
 from notecast.config import get_settings
 from notecast.eval.retrieval import format_report, load_eval_cases, run_retrieval_eval
@@ -24,8 +30,10 @@ from notecast.index.embedder import EmbedderUnavailableError
 from notecast.index.service import IndexNotBuiltError, get_retriever, index_notebook
 from notecast.index.store import IndexMismatchError, SearchMode
 from notecast.ingest.course import display_name, load_course_config
-from notecast.models import SearchFilters
+from notecast.models import Chunk, SearchFilters
 from notecast.notebook import Notebook
+
+_YES_HELP = "Skip confirmation prompts (for API spend)."
 
 app = typer.Typer(
     add_completion=False, help="NoteCast: notes and audio overviews for your courses."
@@ -245,13 +253,61 @@ def _get_retriever_or_exit(notebook: Notebook):  # noqa: ANN201
         raise typer.Exit(code=1) from None
 
 
+def _filter_chunks(chunks: list[Chunk], filters: SearchFilters | None) -> list[Chunk]:
+    """Apply a `SearchFilters` to a full chunk list (weeks/source_types/
+    source_paths), for deep mode's `chunk_source`.
+    """
+    if filters is None:
+        return chunks
+    result = chunks
+    if filters.weeks:
+        weeks = set(filters.weeks)
+        result = [c for c in result if c.week in weeks]
+    if filters.source_types:
+        types = set(filters.source_types)
+        result = [c for c in result if c.source_type in types]
+    if filters.source_paths:
+        paths = set(filters.source_paths)
+        result = [c for c in result if c.source_path in paths]
+    return result
+
+
 def _make_chat_session(notebook: Notebook, retriever) -> ChatSession:  # noqa: ANN001
     course_name = display_name(notebook, load_course_config(notebook))
     try:
-        return ChatSession(retriever, course_name=course_name)
+        return ChatSession(
+            retriever,
+            course_name=course_name,
+            chunk_source=lambda filters: _filter_chunks(retriever.store.all_chunks(), filters),
+        )
     except MissingApiKeyError as exc:
         typer.echo(str(exc))
         raise typer.Exit(code=1) from None
+
+
+def _confirm_deep_mode(session: ChatSession, filters: SearchFilters | None, yes: bool) -> bool:
+    """Print deep mode's cost estimate and ask for confirmation, unless
+    `yes`. Returns True if the caller should proceed with the deep question.
+    """
+    try:
+        tokens, _total_cost = session.estimate_deep_cost(filters)
+    except ChatError as exc:
+        typer.echo(str(exc))
+        return False
+
+    model = session.settings.deep_model
+    first_cost = estimate_api_cost(model, {"cache_write_tokens": tokens}) or 0.0
+    follow_up_cost = estimate_api_cost(model, {"cache_read_tokens": tokens}) or 0.0
+    typer.echo(
+        f"Deep mode will send ~{tokens:,} tokens: "
+        f"~${first_cost:.4f} first question, ~${follow_up_cost:.4f} per follow-up."
+    )
+    if yes:
+        return True
+    if not typer.confirm("Continue?"):
+        typer.echo("Cancelled.")
+        return False
+    return True
 
 
 @app.command("ask")
@@ -259,20 +315,25 @@ def ask(
     slug: str,
     question: str,
     mode: ChatMode = typer.Option(  # noqa: B008
-        "sources", "--mode", help="sources or open."
+        "sources", "--mode", help="sources, open or deep."
     ),
     week: list[int] = typer.Option(  # noqa: B008
         None, "--week", help="Restrict to this week (repeatable)."
     ),
     k: int = typer.Option(None, "-k", help="Number of chunks to retrieve."),  # noqa: B008
+    yes: bool = typer.Option(False, "--yes", "-y", help=_YES_HELP),
 ) -> None:
     """Ask a single grounded question of a notebook's material."""
     notebook = _load_notebook_or_exit(slug)
     retriever = _get_retriever_or_exit(notebook)
     session = _make_chat_session(notebook, retriever)
+    filters = _make_filters(week)
+
+    if mode == "deep" and not _confirm_deep_mode(session, filters, yes):
+        raise typer.Exit(code=1)
 
     try:
-        answer = session.ask(question, mode=mode, filters=_make_filters(week), k=k)
+        answer = session.ask(question, mode=mode, filters=filters, k=k)
     except MissingApiKeyError as exc:
         typer.echo(str(exc))
         raise typer.Exit(code=1) from None
@@ -283,18 +344,19 @@ def ask(
     _print_answer(answer)
 
 
-_CHAT_HELP = "Commands: /mode sources|open, /week N (or /week all), /reset, /quit"
+_CHAT_HELP = "Commands: /mode sources|open|deep, /week N (or /week all), /reset, /quit"
 
 
 @app.command("chat")
 def chat(
     slug: str,
     mode: ChatMode = typer.Option(  # noqa: B008
-        "sources", "--mode", help="sources or open."
+        "sources", "--mode", help="sources, open or deep."
     ),
     week: list[int] = typer.Option(  # noqa: B008
         None, "--week", help="Restrict to this week (repeatable)."
     ),
+    yes: bool = typer.Option(False, "--yes", "-y", help=_YES_HELP),
 ) -> None:
     """Chat interactively with a notebook's material."""
     notebook = _load_notebook_or_exit(slug)
@@ -304,6 +366,7 @@ def chat(
     current_mode: ChatMode = mode
     filters = _make_filters(week)
     total_cost = 0.0
+    deep_confirmed = False
 
     typer.echo(f"Chatting with {slug!r} (mode: {current_mode}).")
     typer.echo(_CHAT_HELP)
@@ -327,11 +390,11 @@ def chat(
             continue
         if line.startswith("/mode"):
             parts = line.split()
-            if len(parts) == 2 and parts[1] in ("sources", "open"):
+            if len(parts) == 2 and parts[1] in ("sources", "open", "deep"):
                 current_mode = parts[1]  # type: ignore[assignment]
                 typer.echo(f"Mode set to {current_mode}.")
             else:
-                typer.echo("Usage: /mode sources|open")
+                typer.echo("Usage: /mode sources|open|deep")
             continue
         if line.startswith("/week"):
             parts = line.split()
@@ -344,6 +407,11 @@ def chat(
             else:
                 typer.echo("Usage: /week N or /week all")
             continue
+
+        if current_mode == "deep" and not deep_confirmed:
+            if not _confirm_deep_mode(session, filters, yes):
+                continue
+            deep_confirmed = True
 
         try:
             answer = session.ask(line, mode=current_mode, filters=filters)
@@ -406,6 +474,7 @@ def audio(
     minutes_max: int | None = typer.Option(
         None, "--minutes-max", help="Override the maximum length (minutes) for this run."
     ),
+    yes: bool = typer.Option(False, "--yes", "-y", help=_YES_HELP),
 ) -> None:
     """Generate an audio overview for a notebook."""
     notebook = _load_notebook_or_exit(slug)
@@ -420,6 +489,23 @@ def audio(
     )
 
     try:
+        estimate = estimate_overview_cost(notebook, scope, settings)
+    except IndexNotBuiltError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from None
+    except ValueError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from None
+
+    typer.echo(
+        f"Estimated cost: ~${estimate.est_cost_usd:.4f} "
+        f"(range ${estimate.est_cost_low_usd:.4f}–${estimate.est_cost_high_usd:.4f})"
+    )
+    if not yes and not typer.confirm("Continue?"):
+        typer.echo("Cancelled.")
+        raise typer.Exit(code=1)
+
+    try:
         result = generate_overview(
             notebook, scope, settings=settings, render=False, progress=_progress_echo
         )
@@ -428,6 +514,11 @@ def audio(
         raise typer.Exit(code=1) from None
     except IndexNotBuiltError as exc:
         typer.echo(str(exc))
+        raise typer.Exit(code=1) from None
+    except OverviewFailed as exc:
+        typer.echo(
+            f"Audio generation failed at {exc.stage}: {exc} (spent ~${exc.est_cost_usd:.4f})"
+        )
         raise typer.Exit(code=1) from None
     except ValueError as exc:
         typer.echo(str(exc))
@@ -447,16 +538,28 @@ def audio(
     typer.echo(f"Estimated render time: ~{est_seconds:.0f}s")
 
     try:
-        render_result = render_saved_script(
+        saved = render_saved_script(
             notebook, result.script_json_path, settings=settings, progress=_progress_echo
         )
     except (TTSUnavailableError, InvalidVoiceError) as exc:
         typer.echo(str(exc))
         raise typer.Exit(code=1) from None
 
-    typer.echo(f"Audio: {render_result.mp3_path}")
-    typer.echo(f"Transcript: {render_result.transcript_path}")
+    _warn_if_stale(saved.stale_chunk_ids)
+    typer.echo(f"Audio: {saved.render.mp3_path}")
+    typer.echo(f"Transcript: {saved.render.transcript_path}")
     typer.echo(f"Script JSON: {result.script_json_path}")
+
+
+def _warn_if_stale(stale_chunk_ids: list[str]) -> None:
+    if not stale_chunk_ids:
+        return
+    typer.secho(
+        f"Note: {len(stale_chunk_ids)} cited chunk(s) are no longer in the current index "
+        "(the notebook was likely re-ingested since this script was written); the "
+        "transcript's Sources lines may be incomplete for those lines.",
+        fg=typer.colors.YELLOW,
+    )
 
 
 @app.command("audio-render")
@@ -468,7 +571,16 @@ def audio_render(slug: str, script_json: Path) -> None:
         raise typer.Exit(code=1)
 
     try:
-        render_result = render_saved_script(notebook, script_json, progress=_progress_echo)
+        script = AudioScript.model_validate_json(script_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        typer.echo(f"Could not read script file: {exc}")
+        raise typer.Exit(code=1) from None
+
+    est_seconds = estimate_render_seconds(script)
+    typer.echo(f"Estimated render time: ~{est_seconds:.0f}s")
+
+    try:
+        saved = render_saved_script(notebook, script_json, progress=_progress_echo)
     except IndexNotBuiltError as exc:
         typer.echo(str(exc))
         raise typer.Exit(code=1) from None
@@ -476,8 +588,9 @@ def audio_render(slug: str, script_json: Path) -> None:
         typer.echo(str(exc))
         raise typer.Exit(code=1) from None
 
-    typer.echo(f"Audio: {render_result.mp3_path}")
-    typer.echo(f"Transcript: {render_result.transcript_path}")
+    _warn_if_stale(saved.stale_chunk_ids)
+    typer.echo(f"Audio: {saved.render.mp3_path}")
+    typer.echo(f"Transcript: {saved.render.transcript_path}")
 
 
 if __name__ == "__main__":
