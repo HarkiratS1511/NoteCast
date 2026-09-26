@@ -10,12 +10,10 @@ Drop your lectures, workshops, tutorials, slides, and transcripts into a per-cou
 
 There's no chat attachment limit because your material lives in a local index. Claude only sees the passages relevant to each question, or a whole week's content when that's what the task needs.
 
-> **Status:** Phases 0–6 done (ingest, search, grounded chat in sources/open/deep
-> modes, multi-notebook support, and audio overviews). Phase 7 (the Streamlit
-> web UI) is built and in verification. See [`docs/LEARN.md`](docs/LEARN.md)
-> for the plain-English write-up of how each phase works, and
-> [`docs/PLAN.md`](docs/PLAN.md) for the architecture, build-phase status, and
-> open decisions.
+> **Status:** Phases 0–7 done and verified (ingest, search, grounded chat in
+> sources/open/deep modes, multi-notebook, audio overviews, web UI). Next: a
+> real end-to-end run with an API key. See [`docs/LEARN.md`](docs/LEARN.md) and
+> [`docs/PLAN.md`](docs/PLAN.md).
 
 ## How it works (short version)
 
@@ -31,7 +29,7 @@ question ──► hybrid search (vector + keyword) ──► rerank ──►�
 
 Audio overviews use the same grounding, then script ► Kokoro TTS (two voices) ► stitched MP3.
 
-## Planned stack
+## Stack
 
 | Layer | Choice |
 |---|---|
@@ -40,10 +38,10 @@ Audio overviews use the same grounding, then script ► Kokoro TTS (two voices) 
 | Vector store | LanceDB (embedded, built-in full-text search for hybrid retrieval) |
 | Embeddings | `fastembed` (ONNX) running `BAAI/bge-small-en-v1.5` locally — no GPU/PyTorch needed |
 | LLM | Claude API via the official `anthropic` SDK, with native citations, prompt caching, and web search |
-| TTS | Kokoro via `kokoro-onnx` (planned) |
+| TTS | Kokoro via `kokoro-onnx`, runs locally (free); MP3 via `lameenc` |
 | UI | Streamlit (local web UI) + thin CLI |
 
-## Layout (planned)
+## Layout
 
 ```
 notecast/                   # Python package
