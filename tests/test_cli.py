@@ -289,12 +289,21 @@ class FakeChatSession:
     scripted sequence of `ChatAnswer`s and records how it was called.
     """
 
-    def __init__(self, answers: list, *, deep_tokens: int = 1000, deep_cost: float = 0.01) -> None:
+    def __init__(
+        self,
+        answers: list,
+        *,
+        deep_tokens: int | list[int] = 1000,
+        deep_cost: float = 0.01,
+    ) -> None:
         self._answers = list(answers)
         self.calls: list[dict] = []
         self.reset_calls = 0
         self.settings = _FakeDeepSettings()
-        self._deep_tokens = deep_tokens
+        # Either a fixed token count for every call, or a list popped one
+        # value at a time (so a test can simulate the scope growing after a
+        # `/week` change between deep turns).
+        self._deep_tokens = list(deep_tokens) if isinstance(deep_tokens, list) else deep_tokens
         self._deep_cost = deep_cost
         self.estimate_deep_cost_calls = 0
 
@@ -305,7 +314,11 @@ class FakeChatSession:
 
     def estimate_deep_cost(self, filters=None):  # noqa: ANN001
         self.estimate_deep_cost_calls += 1
-        return self._deep_tokens, self._deep_cost
+        if isinstance(self._deep_tokens, list):
+            tokens = self._deep_tokens.pop(0)
+        else:
+            tokens = self._deep_tokens
+        return tokens, self._deep_cost
 
     def ask(self, question, *, mode="sources", filters=None, k=None):  # noqa: ANN001
         self.calls.append({"question": question, "mode": mode, "filters": filters, "k": k})
@@ -564,8 +577,74 @@ def test_chat_deep_mode_estimate_shown_once(
     assert result.exit_code == 0
     assert "Deep one." in result.output
     assert "Deep two." in result.output
+    # The estimate is re-checked every deep turn (so scope growth via /week
+    # can be caught), but the same-size second turn doesn't re-print it or
+    # ask for confirmation again.
     assert result.output.count("Deep mode will send") == 1
-    assert fake_session.estimate_deep_cost_calls == 1
+    assert fake_session.estimate_deep_cost_calls == 2
+
+
+def test_chat_deep_mode_reconfirms_when_scope_grows_after_week_change(
+    tmp_notebooks_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `/week` change that grows the deep scope must be confirmed again,
+    even though deep mode was already confirmed once this session.
+    """
+    import notecast.cli as cli_mod
+
+    _indexed_notebook(tmp_notebooks_root)
+    answers = [
+        _fake_answer([("Deep one.", [])]),
+        _fake_answer([("Deep two.", [])]),
+    ]
+    # First deep turn: 2,000 tokens (week 1). After "/week all", the second
+    # deep turn covers everything: 9,000 tokens -- bigger, so it must be
+    # confirmed again.
+    fake_session = FakeChatSession(answers, deep_tokens=[2000, 9000], deep_cost=0.02)
+    monkeypatch.setattr(cli_mod, "ChatSession", fake_session)
+
+    result = runner.invoke(
+        app,
+        ["chat", "my-course", "--mode", "deep", "--week", "1"],
+        input="q1\ny\n/week all\nq2\ny\n/quit\n",
+    )
+
+    assert result.exit_code == 0
+    assert "Deep one." in result.output
+    assert "Deep two." in result.output
+    assert result.output.count("Deep mode will send") == 2
+    assert "~2,000 tokens" in result.output
+    assert "~9,000 tokens" in result.output
+    assert fake_session.estimate_deep_cost_calls == 2
+
+
+def test_chat_deep_mode_no_reconfirm_when_scope_shrinks(
+    tmp_notebooks_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `/week` change that *shrinks* the deep scope shouldn't trigger a
+    second confirmation -- only growth past what's already been confirmed
+    does.
+    """
+    import notecast.cli as cli_mod
+
+    _indexed_notebook(tmp_notebooks_root)
+    answers = [
+        _fake_answer([("Deep one.", [])]),
+        _fake_answer([("Deep two.", [])]),
+    ]
+    fake_session = FakeChatSession(answers, deep_tokens=[9000, 2000], deep_cost=0.02)
+    monkeypatch.setattr(cli_mod, "ChatSession", fake_session)
+
+    result = runner.invoke(
+        app,
+        ["chat", "my-course", "--mode", "deep"],
+        input="q1\ny\n/week 1\nq2\n/quit\n",
+    )
+
+    assert result.exit_code == 0
+    assert "Deep one." in result.output
+    assert "Deep two." in result.output
+    assert result.output.count("Deep mode will send") == 1
 
 
 # --- audio -------------------------------------------------------------

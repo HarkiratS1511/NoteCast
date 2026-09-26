@@ -26,6 +26,7 @@ from notecast.audio.models import (
     ScriptLine,
 )
 from notecast.audio.service import OverviewResult, generate_overview, render_saved_script
+from notecast.chat.pricing import estimate_cost
 from notecast.models import Chunk, Location, SourceType
 from notecast.notebook import Notebook
 
@@ -390,6 +391,61 @@ def test_generate_overview_wraps_failure_with_spend_so_far(
     assert err.stage == "key_points"
     assert err.est_cost_usd > 0
     assert "boom during extraction" in str(err)
+
+
+def test_generate_overview_scripting_failure_includes_partial_script_spend(
+    notebook: Notebook, pipeline: FakePipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `write_script` failure that carries `partial_est_cost_usd` (e.g. a
+    refusal partway through a multi-chapter episode) should have that spend
+    folded into the reported cost, on top of the key-point/merge spend.
+    """
+    _patch_retriever(monkeypatch, _sample_chunks())
+    scope = AudioScope(weeks=[1])
+
+    def _spendy_write_script(plan, chunks, *, client, settings, course_name=""):  # noqa: ANN001
+        err = service.ChatError("refused on chapter 3")
+        err.partial_est_cost_usd = 0.4321
+        raise err
+
+    monkeypatch.setattr(service, "write_script", _spendy_write_script)
+
+    with pytest.raises(service.OverviewFailed) as exc_info:
+        generate_overview(notebook, scope, client=object(), render=False)
+
+    err = exc_info.value
+    assert err.stage == "scripting"
+    # kp_usage spend (extraction + merge) plus the script's partial spend.
+    expected_kp_cost = (
+        estimate_cost("claude-haiku-4-5", {"input_tokens": 100, "output_tokens": 50}) or 0.0
+    ) + (estimate_cost("claude-sonnet-5", {"input_tokens": 200, "output_tokens": 100}) or 0.0)
+    assert err.est_cost_usd == pytest.approx(expected_kp_cost + 0.4321)
+
+
+def test_generate_overview_scripting_failure_without_partial_cost_defaults_to_zero(
+    notebook: Notebook, pipeline: FakePipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plain ChatError without `partial_est_cost_usd` (e.g. from code that
+    hasn't been updated to attach it) shouldn't blow up -- it just falls
+    back to no extra spend on top of the key-point/merge cost.
+    """
+    _patch_retriever(monkeypatch, _sample_chunks())
+    scope = AudioScope(weeks=[1])
+
+    def _plain_write_script(plan, chunks, *, client, settings, course_name=""):  # noqa: ANN001
+        raise service.ChatError("no partial cost attached")
+
+    monkeypatch.setattr(service, "write_script", _plain_write_script)
+
+    with pytest.raises(service.OverviewFailed) as exc_info:
+        generate_overview(notebook, scope, client=object(), render=False)
+
+    err = exc_info.value
+    assert err.stage == "scripting"
+    expected_kp_cost = (
+        estimate_cost("claude-haiku-4-5", {"input_tokens": 100, "output_tokens": 50}) or 0.0
+    ) + (estimate_cost("claude-sonnet-5", {"input_tokens": 200, "output_tokens": 100}) or 0.0)
+    assert err.est_cost_usd == pytest.approx(expected_kp_cost)
 
 
 def test_generate_overview_failure_before_any_spend_is_not_wrapped(

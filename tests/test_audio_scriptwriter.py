@@ -530,6 +530,73 @@ def test_chapter_refusal_raises_chat_error_naming_the_chapter() -> None:
     assert "cyber" in message
 
 
+def test_refusal_on_chapter_3_of_4_reports_partial_spend_for_chapters_1_and_2() -> None:
+    """A failure partway through a longer episode should carry the cost of
+    the chapters that *did* complete, not $0 -- the chapter that fails
+    contributes nothing (its own attempt's tokens aren't counted, since
+    `_generate_chapter` raises before returning them to the caller).
+    """
+    from notecast.chat.pricing import estimate_cost
+
+    points = [
+        RankedKeyPoint(
+            id=f"kp-{i}", title=f"Point {i}", summary="x", tier="A", rank=i, source_chunk_ids=["c1"]
+        )
+        for i in range(1, 5)
+    ]
+    chapters_plan = [
+        ChapterPlan(index=i, title=f"Chapter {i}", point_ids=[f"kp-{i}"], target_words=100)
+        for i in range(1, 5)
+    ]
+    plan = AudioPlan(
+        scope=AudioScope(weeks=[1]),
+        points=points,
+        target_minutes=8,
+        target_words=400,
+        chapters=chapters_plan,
+    )
+    chunks = [_chunk("c1", "week-01.pptx", 0, "Some text.")]
+
+    client = FakeClient(
+        stream_responses=[
+            _chapter_message(
+                [{"speaker": "A", "text": "Chapter one.", "source_chunk_ids": ["c1"]}],
+                input_tokens=100,
+                output_tokens=50,
+            ),
+            _chapter_message(
+                [{"speaker": "A", "text": "Chapter two.", "source_chunk_ids": ["c1"]}],
+                input_tokens=100,
+                output_tokens=50,
+            ),
+            _chapter_message(
+                [],
+                stop_reason="refusal",
+                stop_details={"category": "policy"},
+            ),
+        ],
+        create_responses=[],
+    )
+
+    with pytest.raises(ChatError) as exc_info:
+        write_script(plan, chunks, client=client, settings=_settings(), course_name="COMP4650")
+
+    expected_cost = estimate_cost(
+        "claude-sonnet-5",
+        {
+            "input_tokens": 200,
+            "output_tokens": 100,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+        },
+    )
+    assert exc_info.value.partial_est_cost_usd == pytest.approx(expected_cost)
+    # Only the two chapters that completed made API calls; the third
+    # (refused) chapter and the coverage check never ran.
+    assert len(client.messages.stream_calls) == 3
+    assert len(client.messages.create_calls) == 0
+
+
 def test_chapter_max_tokens_exhausted_after_retry_raises_chat_error() -> None:
     client = FakeClient(
         stream_responses=[

@@ -85,80 +85,92 @@ def write_script(
 
     chapters: list[ChapterScript] = []
     recaps: list[str] = []
-    for i, chapter_plan in enumerate(sorted_chapter_plans):
-        chapter_points = _points_for(chapter_plan, points_by_id)
-        running_recap = _build_running_recap(recaps, chapter_titles[:i])
-        chapter_script, recap, usage = _generate_chapter(
-            client=client,
-            settings=settings,
-            system_blocks=system_blocks,
-            material_content=material_content,
-            chapter_plan=chapter_plan,
-            points=chapter_points,
-            running_recap=running_recap,
-            is_first=(i == 0),
-            is_last=(i == len(sorted_chapter_plans) - 1),
-            valid_chunk_ids=valid_chunk_ids,
-        )
-        _accumulate_usage(usage_by_model[settings.script_model], usage)
-        chapters.append(chapter_script)
-        recaps.append(recap)
-
-    tier_a_points = [point for point in plan.points if point.tier == "A"]
-    tier_a_ids = {point.id for point in tier_a_points}
-
-    coverage_data, cov_usage = _check_coverage(client, settings, tier_a_points, chapters)
-    _accumulate_usage(usage_by_model[settings.helper_model], cov_usage)
-    covered = set(coverage_data.get("covered_ids", [])) & tier_a_ids
-    # Anything not explicitly confirmed covered counts as missing — don't
-    # trust the model's own `missing_ids` list, which can be inconsistent
-    # with what it actually put in `covered_ids`.
-    missing = tier_a_ids - covered
-
-    patched: list[str] = []
-    notes: list[str] = []
-
-    if missing:
-        chapters_to_fix = _chapters_owning(sorted_chapter_plans, missing)
-        if not chapters_to_fix:
-            notes.append(
-                "Coverage check flagged points that no chapter plan owns, so they "
-                f"could not be patched by regenerating a chapter: {', '.join(sorted(missing))}"
+    try:
+        for i, chapter_plan in enumerate(sorted_chapter_plans):
+            chapter_points = _points_for(chapter_plan, points_by_id)
+            running_recap = _build_running_recap(recaps, chapter_titles[:i])
+            chapter_script, recap, usage = _generate_chapter(
+                client=client,
+                settings=settings,
+                system_blocks=system_blocks,
+                material_content=material_content,
+                chapter_plan=chapter_plan,
+                points=chapter_points,
+                running_recap=running_recap,
+                is_first=(i == 0),
+                is_last=(i == len(sorted_chapter_plans) - 1),
+                valid_chunk_ids=valid_chunk_ids,
             )
-        else:
-            for idx, missing_ids in chapters_to_fix.items():
-                chapter_plan = sorted_chapter_plans[idx]
-                chapter_points = _points_for(chapter_plan, points_by_id)
-                missed_points = [points_by_id[pid] for pid in missing_ids if pid in points_by_id]
-                running_recap = _build_running_recap(recaps[:idx], chapter_titles[:idx])
-                chapter_script, recap, usage = _generate_chapter(
-                    client=client,
-                    settings=settings,
-                    system_blocks=system_blocks,
-                    material_content=material_content,
-                    chapter_plan=chapter_plan,
-                    points=chapter_points,
-                    running_recap=running_recap,
-                    is_first=(idx == 0),
-                    is_last=(idx == len(sorted_chapter_plans) - 1),
-                    valid_chunk_ids=valid_chunk_ids,
-                    missed_points=missed_points,
-                )
-                _accumulate_usage(usage_by_model[settings.script_model], usage)
-                chapters[idx] = chapter_script
-                recaps[idx] = recap
-                notes.append(
-                    f"Regenerated chapter {chapter_plan.index} ({chapter_plan.title}) "
-                    f"to cover: {', '.join(sorted(missing_ids))}"
-                )
+            _accumulate_usage(usage_by_model[settings.script_model], usage)
+            chapters.append(chapter_script)
+            recaps.append(recap)
 
-            coverage_data2, cov_usage2 = _check_coverage(client, settings, tier_a_points, chapters)
-            _accumulate_usage(usage_by_model[settings.helper_model], cov_usage2)
-            covered2 = set(coverage_data2.get("covered_ids", [])) & tier_a_ids
-            missing2 = tier_a_ids - covered2
-            patched = sorted(missing - missing2)
-            covered = covered2
-            missing = missing2
+        tier_a_points = [point for point in plan.points if point.tier == "A"]
+        tier_a_ids = {point.id for point in tier_a_points}
+
+        coverage_data, cov_usage = _check_coverage(client, settings, tier_a_points, chapters)
+        _accumulate_usage(usage_by_model[settings.helper_model], cov_usage)
+        covered = set(coverage_data.get("covered_ids", [])) & tier_a_ids
+        # Anything not explicitly confirmed covered counts as missing — don't
+        # trust the model's own `missing_ids` list, which can be inconsistent
+        # with what it actually put in `covered_ids`.
+        missing = tier_a_ids - covered
+
+        patched: list[str] = []
+        notes: list[str] = []
+
+        if missing:
+            chapters_to_fix = _chapters_owning(sorted_chapter_plans, missing)
+            if not chapters_to_fix:
+                notes.append(
+                    "Coverage check flagged points that no chapter plan owns, so they "
+                    f"could not be patched by regenerating a chapter: {', '.join(sorted(missing))}"
+                )
+            else:
+                for idx, missing_ids in chapters_to_fix.items():
+                    chapter_plan = sorted_chapter_plans[idx]
+                    chapter_points = _points_for(chapter_plan, points_by_id)
+                    missed_points = [
+                        points_by_id[pid] for pid in missing_ids if pid in points_by_id
+                    ]
+                    running_recap = _build_running_recap(recaps[:idx], chapter_titles[:idx])
+                    chapter_script, recap, usage = _generate_chapter(
+                        client=client,
+                        settings=settings,
+                        system_blocks=system_blocks,
+                        material_content=material_content,
+                        chapter_plan=chapter_plan,
+                        points=chapter_points,
+                        running_recap=running_recap,
+                        is_first=(idx == 0),
+                        is_last=(idx == len(sorted_chapter_plans) - 1),
+                        valid_chunk_ids=valid_chunk_ids,
+                        missed_points=missed_points,
+                    )
+                    _accumulate_usage(usage_by_model[settings.script_model], usage)
+                    chapters[idx] = chapter_script
+                    recaps[idx] = recap
+                    notes.append(
+                        f"Regenerated chapter {chapter_plan.index} ({chapter_plan.title}) "
+                        f"to cover: {', '.join(sorted(missing_ids))}"
+                    )
+
+                coverage_data2, cov_usage2 = _check_coverage(
+                    client, settings, tier_a_points, chapters
+                )
+                _accumulate_usage(usage_by_model[settings.helper_model], cov_usage2)
+                covered2 = set(coverage_data2.get("covered_ids", [])) & tier_a_ids
+                missing2 = tier_a_ids - covered2
+                patched = sorted(missing - missing2)
+                covered = covered2
+                missing = missing2
+    except ChatError as exc:
+        # Attach whatever this run had already spent (earlier chapters, plus
+        # any coverage calls) before re-raising, so a caller that lost the
+        # rest of the episode to this failure can still report accurately
+        # what was actually spent, rather than $0.
+        exc.partial_est_cost_usd = _estimate_total_cost(usage_by_model) or 0.0  # type: ignore[attr-defined]
+        raise
 
     coverage = CoverageReport(
         covered=sorted(covered),

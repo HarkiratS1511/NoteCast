@@ -285,15 +285,32 @@ def _make_chat_session(notebook: Notebook, retriever) -> ChatSession:  # noqa: A
         raise typer.Exit(code=1) from None
 
 
-def _confirm_deep_mode(session: ChatSession, filters: SearchFilters | None, yes: bool) -> bool:
+def _confirm_deep_mode(
+    session: ChatSession,
+    filters: SearchFilters | None,
+    yes: bool,
+    confirmed_tokens: int | None = None,
+) -> tuple[bool, int | None]:
     """Print deep mode's cost estimate and ask for confirmation, unless
-    `yes`. Returns True if the caller should proceed with the deep question.
+    `yes` or the current scope's token estimate hasn't grown past
+    `confirmed_tokens` (the size last confirmed in this session, if any --
+    a REPL passes this back in after a `/week` change grows the scope, so
+    the increase gets its own confirmation instead of riding on an earlier,
+    smaller one).
+
+    Returns `(proceed, new_confirmed_tokens)`: `proceed` is True if the
+    caller should go ahead with the deep question, and `new_confirmed_tokens`
+    is what the caller should remember as "confirmed" for next time (it's
+    unchanged when declined or when re-confirmation wasn't needed).
     """
     try:
         tokens, _total_cost = session.estimate_deep_cost(filters)
     except ChatError as exc:
         typer.echo(str(exc))
-        return False
+        return False, confirmed_tokens
+
+    if confirmed_tokens is not None and tokens <= confirmed_tokens:
+        return True, confirmed_tokens
 
     model = session.settings.deep_model
     first_cost = estimate_api_cost(model, {"cache_write_tokens": tokens}) or 0.0
@@ -303,11 +320,11 @@ def _confirm_deep_mode(session: ChatSession, filters: SearchFilters | None, yes:
         f"~${first_cost:.4f} first question, ~${follow_up_cost:.4f} per follow-up."
     )
     if yes:
-        return True
+        return True, tokens
     if not typer.confirm("Continue?"):
         typer.echo("Cancelled.")
-        return False
-    return True
+        return False, confirmed_tokens
+    return True, tokens
 
 
 @app.command("ask")
@@ -329,8 +346,10 @@ def ask(
     session = _make_chat_session(notebook, retriever)
     filters = _make_filters(week)
 
-    if mode == "deep" and not _confirm_deep_mode(session, filters, yes):
-        raise typer.Exit(code=1)
+    if mode == "deep":
+        proceed, _confirmed_tokens = _confirm_deep_mode(session, filters, yes)
+        if not proceed:
+            raise typer.Exit(code=1)
 
     try:
         answer = session.ask(question, mode=mode, filters=filters, k=k)
@@ -366,7 +385,7 @@ def chat(
     current_mode: ChatMode = mode
     filters = _make_filters(week)
     total_cost = 0.0
-    deep_confirmed = False
+    confirmed_deep_tokens: int | None = None
 
     typer.echo(f"Chatting with {slug!r} (mode: {current_mode}).")
     typer.echo(_CHAT_HELP)
@@ -408,10 +427,12 @@ def chat(
                 typer.echo("Usage: /week N or /week all")
             continue
 
-        if current_mode == "deep" and not deep_confirmed:
-            if not _confirm_deep_mode(session, filters, yes):
+        if current_mode == "deep":
+            proceed, confirmed_deep_tokens = _confirm_deep_mode(
+                session, filters, yes, confirmed_deep_tokens
+            )
+            if not proceed:
                 continue
-            deep_confirmed = True
 
         try:
             answer = session.ask(line, mode=current_mode, filters=filters)

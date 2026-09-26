@@ -324,7 +324,8 @@ def generate_overview(
             plan, selected, client=client, settings=settings, course_name=course_name
         )
     except (ChatError, ValueError) as exc:
-        raise OverviewFailed("scripting", kp_usage.est_cost_usd, str(exc)) from exc
+        spent = kp_usage.est_cost_usd + getattr(exc, "partial_est_cost_usd", 0.0)
+        raise OverviewFailed("scripting", spent, str(exc)) from exc
     _timed("scripting", 0.8, t)
 
     t = time.monotonic()
