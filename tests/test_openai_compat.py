@@ -313,6 +313,209 @@ def test_end_to_end_not_in_sources_via_grounding_parse_response() -> None:
     assert segments[0].text == "The material doesn't cover this."
 
 
+# --- Citation markers vs. code indexing / code spans -----------------------
+
+
+def test_code_indexing_not_mistaken_for_citations() -> None:
+    hit1 = _hit("c1", "First source content.")
+    hit2 = _hit("c2", "Second source content.")
+    sources = hits_to_search_results([hit1, hit2])
+    fake = FakeOpenAI(
+        responses=[
+            _completion(
+                "Then x[2]=arr[1]+1. Chained access looks like matrix[1][2] and foo()[1].bar too."
+            )
+        ]
+    )
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model",
+        max_tokens=100,
+        system="sys",
+        messages=[{"role": "user", "content": [*sources, {"type": "text", "text": "Q"}]}],
+    )
+    # Every bracket here is followed by a code continuation (=, +, [, .bar),
+    # so none of them were treated as citations: one uncited block, brackets
+    # intact.
+    assert len(message.content) == 1
+    assert message.content[0].citations is None
+    assert message.content[0].text == (
+        "Then x[2]=arr[1]+1. Chained access looks like matrix[1][2] and foo()[1].bar too."
+    )
+
+
+def test_prose_touching_brackets_is_still_a_citation_even_after_an_identifier() -> None:
+    """False negatives on prose are worse than rare false positives (code
+    is separately protected by fenced/inline spans) — so a bracket that
+    merely touches an identifier or closing paren, with nothing code-like
+    *after* it, is still read as a citation.
+    """
+    hit1 = _hit("c1", "First source content.")
+    hit2 = _hit("c2", "Second source content.")
+    sources = hits_to_search_results([hit1, hit2])
+    fake = FakeOpenAI(
+        responses=[
+            _completion("The complexity is O(n)[1]. This déjà vu[2] confirms the set[1] result.")
+        ]
+    )
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model",
+        max_tokens=100,
+        system="sys",
+        messages=[{"role": "user", "content": [*sources, {"type": "text", "text": "Q"}]}],
+    )
+    full_text = "".join(b.text for b in message.content)
+    assert "[1]" not in full_text
+    assert "[2]" not in full_text
+    cited_indices = {
+        c.search_result_index for b in message.content if b.citations for c in b.citations
+    }
+    assert cited_indices == {0, 1}
+
+
+def test_real_citations_still_work_alongside_prose_that_touches_brackets() -> None:
+    hit1 = _hit("c1", "First source content.")
+    hit2 = _hit("c2", "Second source content.")
+    sources = hits_to_search_results([hit1, hit2])
+    fake = FakeOpenAI(
+        responses=[_completion("Gradient descent minimises loss.[2] Loss [1] is the objective.")]
+    )
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model",
+        max_tokens=100,
+        system="sys",
+        messages=[{"role": "user", "content": [*sources, {"type": "text", "text": "Q"}]}],
+    )
+    blocks = message.content
+    assert blocks[0].text == "Gradient descent minimises loss."
+    assert blocks[0].citations[0].search_result_index == 1
+    assert blocks[1].text == " Loss "
+    assert blocks[1].citations[0].search_result_index == 0
+    assert blocks[2].text == " is the objective."
+
+
+# --- Leading markers (regression: "" was matching `in ")]"`) ---------------
+
+
+def test_leading_single_marker_at_start_of_text_is_a_citation() -> None:
+    hit1 = _hit("c1", "Some content.")
+    sources = hits_to_search_results([hit1])
+    fake = FakeOpenAI(responses=[_completion("[1] According to the slides, X happens.")])
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model",
+        max_tokens=100,
+        system="sys",
+        messages=[{"role": "user", "content": [*sources, {"type": "text", "text": "Q"}]}],
+    )
+    full_text = "".join(b.text for b in message.content)
+    assert "[1]" not in full_text
+    assert message.content[0].citations is not None
+    assert message.content[0].citations[0].search_result_index == 0
+
+
+def test_leading_double_marker_at_start_of_text_is_a_citation() -> None:
+    hit1 = _hit("c1", "First.")
+    hit2 = _hit("c2", "Second.")
+    sources = hits_to_search_results([hit1, hit2])
+    fake = FakeOpenAI(responses=[_completion("[1][2] Both sources apply here.")])
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model",
+        max_tokens=100,
+        system="sys",
+        messages=[{"role": "user", "content": [*sources, {"type": "text", "text": "Q"}]}],
+    )
+    assert message.content[0].citations is not None
+    assert {c.search_result_index for c in message.content[0].citations} == {0, 1}
+
+
+def test_leading_comma_list_marker_at_start_of_text_is_a_citation() -> None:
+    hits = [_hit(f"c{i}", f"Content {i}.") for i in range(1, 6)]
+    sources = hits_to_search_results(hits)
+    fake = FakeOpenAI(responses=[_completion("[2, 5] are the relevant sources.")])
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model",
+        max_tokens=100,
+        system="sys",
+        messages=[{"role": "user", "content": [*sources, {"type": "text", "text": "Q"}]}],
+    )
+    assert message.content[0].citations is not None
+    assert {c.search_result_index for c in message.content[0].citations} == {1, 4}
+
+
+def test_markers_inside_inline_code_span_left_untouched() -> None:
+    hit1 = _hit("c1", "Some content.")
+    sources = hits_to_search_results([hit1])
+    fake = FakeOpenAI(
+        responses=[_completion("See `weights[1]` in the code, but the concept is cited [1].")]
+    )
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model",
+        max_tokens=100,
+        system="sys",
+        messages=[{"role": "user", "content": [*sources, {"type": "text", "text": "Q"}]}],
+    )
+    full_text = "".join(b.text for b in message.content)
+    assert "`weights[1]`" in full_text
+    cited_blocks = [b for b in message.content if b.citations]
+    assert len(cited_blocks) == 1
+    assert cited_blocks[0].citations[0].search_result_index == 0
+
+
+def test_markers_inside_fenced_code_block_left_untouched() -> None:
+    hit1 = _hit("c1", "Some content.")
+    sources = hits_to_search_results([hit1])
+    code_block = "```python\narr[1] = arr[2]\n```"
+    fake = FakeOpenAI(
+        responses=[_completion(f"Here is the snippet:\n{code_block}\nSee source [1].")]
+    )
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model",
+        max_tokens=100,
+        system="sys",
+        messages=[{"role": "user", "content": [*sources, {"type": "text", "text": "Q"}]}],
+    )
+    full_text = "".join(b.text for b in message.content)
+    assert code_block in full_text
+    cited_blocks = [b for b in message.content if b.citations]
+    assert len(cited_blocks) == 1
+    assert cited_blocks[0].citations[0].search_result_index == 0
+
+
+def test_citation_between_two_fenced_code_blocks_still_works() -> None:
+    """A stray backtick from one fenced block's ``` fence must not make the
+    inline-code regex swallow the real citation (or the next fenced block)
+    between them.
+    """
+    hit1 = _hit("c1", "First.")
+    hit2 = _hit("c2", "Second.")
+    sources = hits_to_search_results([hit1, hit2])
+    text = "```\ncode[1]\n``` and cite [2] then ```more[1]```"
+    fake = FakeOpenAI(responses=[_completion(text)])
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus-model",
+        max_tokens=100,
+        system="sys",
+        messages=[{"role": "user", "content": [*sources, {"type": "text", "text": "Q"}]}],
+    )
+    full_text = "".join(b.text for b in message.content)
+    # The real "[2]" citation marker is stripped; the code-block "[1]"s
+    # (inside fences) are left exactly as they were.
+    assert full_text == text.replace("[2]", "")
+    assert "code[1]" in full_text
+    assert "more[1]" in full_text
+    cited_blocks = [b for b in message.content if b.citations]
+    assert len(cited_blocks) == 1
+    assert cited_blocks[0].citations[0].search_result_index == 1
+
+
 # --- <think> stripping ------------------------------------------------------
 
 

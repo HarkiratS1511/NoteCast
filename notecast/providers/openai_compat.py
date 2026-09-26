@@ -81,7 +81,8 @@ _CITATION_INSTRUCTION = (
     "When you cite the sources given above, put the source's id in square brackets right "
     "after the claim it supports, like [3] or [2][5]. Only cite ids that actually appear in "
     "the sources given to you — never invent an id. Do not add a references/bibliography list "
-    "at the end of your answer."
+    "at the end of your answer. Always put code, array indexing and formulas that use "
+    "square brackets inside `backticks` so they are never mistaken for citations."
 )
 
 _WEB_SEARCH_NOTE = (
@@ -299,23 +300,91 @@ def _parse_marker_ids(group_text: str) -> list[int]:
     return ids
 
 
+_FENCED_CODE_RE = re.compile(r"```.*?```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`[^`\n]*?`")
+
+
+def _code_spans(text: str) -> list[tuple[int, int]]:
+    """Byte ranges of fenced (```...```) and inline (`...`) code spans, so
+    bracket text inside them is never mistaken for a citation marker.
+
+    Fenced spans are masked out (replaced with a same-length placeholder
+    that has no backticks) before scanning for inline spans, so a stray
+    backtick from a `` ``` `` fence — or unpaired backticks inside fenced
+    content — can never make the inline regex swallow real text between,
+    before, or after a fenced block.
+    """
+    spans = [(m.start(), m.end()) for m in _FENCED_CODE_RE.finditer(text)]
+    masked = text
+    for start, end in spans:
+        masked = masked[:start] + ("\x00" * (end - start)) + masked[end:]
+    for m in _INLINE_CODE_RE.finditer(masked):
+        spans.append((m.start(), m.end()))
+    return spans
+
+
+def _in_code_span(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
+    return any(span_start <= start < span_end for span_start, span_end in spans)
+
+
+# Continuation chars that, right after a bracket's "]", read as code rather
+# than prose: an assignment/index/call, an arithmetic operator, another
+# identifier character, or a "." immediately followed by a letter/digit
+# (attribute/method access) — handled separately below.
+_CODE_CONTINUATION_RE = re.compile(r"[A-Za-z0-9_=\[(+\-*/]")
+
+
+def _looks_like_code_index(text: str, start: int, end: int) -> bool:
+    """True when a bracketed `[...]` run at `text[start:end]` reads as code
+    indexing (`x[2]=`, `matrix[1][2]`, `foo()[1].bar`, `arr[1]+1`) rather
+    than a citation marker.
+
+    False negatives on prose are worse than rare false positives here (code
+    is already protected separately by `_code_spans`), so this only flags a
+    run as code when BOTH sides look like code: preceded by an identifier
+    char or a closing `)`/`]`, AND followed by a code continuation. A bare
+    prose case like "the set[1]" or a leading "[1] According to..." is left
+    as a citation.
+    """
+    prev_char = text[start - 1] if start > 0 else ""
+    if not prev_char or not re.match(r"[A-Za-z0-9_)\]]", prev_char):
+        return False
+
+    next_char = text[end] if end < len(text) else ""
+    if not next_char:
+        return False
+    if next_char == ".":
+        return end + 1 < len(text) and text[end + 1].isalnum()
+    return bool(_CODE_CONTINUATION_RE.match(next_char))
+
+
 def _find_marker_runs(text: str) -> list[tuple[int, int, list[int]]]:
     """Find runs of one or more adjacent bracket-groups (e.g. "[2][5]"),
-    each as (start, end, ids).
+    each as (start, end, ids). Runs inside code spans, or that read as code
+    indexing rather than citations, are left out entirely (and so left
+    untouched in the rendered text).
     """
+    code_spans = _code_spans(text)
     matches = list(_MARKER_GROUP_RE.finditer(text))
     runs: list[tuple[int, int, list[int]]] = []
     i = 0
     while i < len(matches):
         start = matches[i].start()
         end = matches[i].end()
+        # The code-index check looks at the character right after the FIRST
+        # group's closing bracket, so chained indexing like "matrix[1][2]"
+        # (next char "[") is still caught once groups are merged below.
+        first_group_end = end
         ids = _parse_marker_ids(matches[i].group(0))
         j = i + 1
         while j < len(matches) and text[end : matches[j].start()].strip() == "":
             end = matches[j].end()
             ids.extend(_parse_marker_ids(matches[j].group(0)))
             j += 1
-        runs.append((start, end, ids))
+        if not _in_code_span(start, end, code_spans) and not _looks_like_code_index(
+            text, start, first_group_end
+        ):
+            runs.append((start, end, ids))
         i = j
     return runs
 
