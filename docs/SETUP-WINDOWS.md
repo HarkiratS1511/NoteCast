@@ -125,15 +125,35 @@ Open it in Notepad (or VS Code, see step 9) and fill it in:
 notepad .env
 ```
 
-You don't need `ANTHROPIC_API_KEY` yet — that's only needed once we build the
-chat feature (a later phase). When you do need it, get a key from
-[console.anthropic.com](https://console.anthropic.com) → **API keys** → create
-a new key, paste it in after `ANTHROPIC_API_KEY=`, and save. **Never commit
-your real `.env` file** — the `.gitignore` already blocks it, so a normal
-`git add`/`git commit` won't pick it up.
+You only need `ANTHROPIC_API_KEY` for commands that call Claude — `ask`,
+`chat`, and `audio`. `ingest` and `search` work without it. See the next
+section for how to get one.
 
 **Check it worked:** open the file again and confirm your edits are saved
 (Notepad shows no "unsaved changes" indicator).
+
+### Getting an Anthropic API key
+
+1. Go to [console.anthropic.com](https://console.anthropic.com) and sign in
+   (or create an account).
+2. Go to **API keys** → **Create key**, give it a name (e.g. "NoteCast"),
+   and copy the key it shows you — it starts with `sk-ant-`. You won't be
+   able to see it again after you leave the page, so copy it now.
+3. Paste it into your `.env` file after `ANTHROPIC_API_KEY=`, with no
+   spaces or quotes, and save.
+4. **Set a spending limit before you do anything else.** In the console,
+   go to **Settings → Limits** (or **Billing**) and set a **monthly spending
+   limit**. A low limit (a few dollars) is plenty while you're learning
+   NoteCast — every command that spends money (`ask`/`chat` in `open` or
+   `deep` mode, and `audio`) shows you an estimated cost and asks you to
+   confirm before it sends anything, but a spending limit is still a good
+   safety net in case of a mistake or a bug.
+
+**Keep your key secret.** Anyone with your API key can spend your credits.
+Never commit your real `.env` file (the `.gitignore` already blocks a
+normal `git add`/`git commit` from picking it up), never paste your key into
+a chat, an issue, or a screenshot, and if you ever think it's leaked,
+revoke it in the console and create a new one.
 
 ## 6. Create a notebook and add your material
 
@@ -183,27 +203,40 @@ folder (`NoteCast/`) so it finds that cache.
 **Check it worked:** the command prints a summary of files parsed/chunked,
 with no errors.
 
-## 8. (Phase 6 onward) Install ffmpeg
+## 8. Generate your first audio overview (optional)
 
-`ffmpeg` is the tool NoteCast will use to stitch together the individual
-lines of a generated audio overview into one MP3 file. Not needed until the
-audio phase (Phase 6):
-
-```powershell
-winget install --id Gyan.FFmpeg -e
-```
-
-Restart your terminal after installing.
-
-**Check it worked:**
+Audio overviews use a local text-to-speech engine called Kokoro, run
+through `kokoro-onnx` — no separate install needed for this step, and
+**`ffmpeg` is not required**: NoteCast stitches the MP3 itself in Python.
 
 ```powershell
-ffmpeg -version
+uv run notecast audio comp4650-document-analysis
 ```
 
-should print a version number, not an error.
+**First run only:** this downloads the Kokoro voice model (~350 MB total,
+model + voices) into `.cache/models/kokoro`. It needs internet the first
+time only; after that it's read from disk, the same way the embedding model
+in step 7 works. It'll also print an estimated cost and ask you to confirm
+before it calls Claude — see [`docs/USAGE.md`](USAGE.md#5-audio-overviews)
+for what the estimate means and what the pipeline does.
 
-## 9. Optional: install VS Code
+**Check it worked:** an MP3 (plus a script and transcript) appears under
+`notebooks/comp4650-document-analysis/audio/`.
+
+## 9. Try the web UI (optional)
+
+NoteCast also has a local web UI, built with Streamlit, covering the same
+chat and audio features as the command line:
+
+```powershell
+uv run streamlit run notecast/ui/app.py
+```
+
+This should open a new browser tab automatically (or print a `localhost`
+address to open yourself). Close it with `Ctrl+C` in the terminal when
+you're done. See [`docs/USAGE.md`](USAGE.md#6-web-ui) for what's in it.
+
+## 10. Optional: install VS Code
 
 VS Code is a code editor. It's optional, but it makes reading and editing
 files (including this repo, your `.env`, and any code) much easier than
@@ -224,7 +257,7 @@ sidebar), and install the **Python** extension (by Microsoft).
 
 ## Troubleshooting
 
-**"`git`/`uv`/`ffmpeg` is not recognized as the name of a command"**
+**"`git`/`uv` is not recognized as the name of a command"**
 The install added itself to your PATH, but your open terminal window doesn't
 know that yet. Close the terminal completely and open a new one. If it still
 fails, sign out and back into Windows (or restart).

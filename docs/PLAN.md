@@ -113,12 +113,30 @@ Parallel tracks are in brackets; they run as simultaneous Sonnet builders.
 |---|---|---|---|
 | **0. Scaffold** | `pyproject` (uv), ruff, pytest, config, `.env.example`, core data models (`Chunk`, `Source`, `Notebook`), and interfaces for parser/embedder/store | [scaffold+core] [Windows setup + LEARN docs] | Done |
 | **1. Ingestion** | all parsers + chunker + manifest/incremental ingest | [PDF] [PPTX+DOCX] [VTT/SRT/TXT] [chunker+manifest] | Done |
-| **2. Index + retrieval** | embedder, LanceDB store, hybrid search, filters | [embedder] [store+hybrid] [eval harness] | In progress |
-| **3. Grounded chat** | Claude client with citations, sources-only mode, citation → location mapping, CLI chat | [claude client+prompts] [citation mapper] [CLI] | Not started |
-| **4. Modes** | open mode + web search, Deep (full-context + caching) mode | [web search] [deep mode] | Not started |
-| **5. Multi-notebook** | create/list/switch/delete courses, scope filters | single builder | Not started |
-| **6. Audio overview** | key points → rank → adaptive outline → chapter scripts → coverage check → Kokoro TTS → stitch | [key points+ranking] [script+coverage] [TTS+stitch] | Not started |
-| **7. UI** | chosen front end | depends on choice | Not started |
+| **2. Index + retrieval** | embedder, LanceDB store, hybrid search, filters | [embedder] [store+hybrid] [eval harness] | Done |
+| **3. Grounded chat** | Claude client with citations, sources-only mode, citation → location mapping, CLI chat | [claude client+prompts] [citation mapper] [CLI] | Done |
+| **4. Modes** | open mode + web search, Deep (full-context + caching) mode | [web search] [deep mode] | Done |
+| **5. Multi-notebook** | create/list/switch/delete courses, scope filters | single builder | Done |
+| **6. Audio overview** | key points → rank → adaptive outline → chapter scripts → coverage check → Kokoro TTS → stitch | [key points+ranking] [script+coverage] [TTS+stitch] | Done |
+| **7. UI** | chosen front end (Streamlit) | depends on choice | In verification — built, not yet checked end-to-end with a real API key |
 | **8. Extras** | quiz/flashcards/study guide; later maybe Whisper transcription and OCR | parallel per feature | Not started |
 
 Phase 1 must be solid before anything else, same as the original plan.
+
+## What's next / open questions
+
+- **Real end-to-end test with an API key.** Everything through Phase 6 has
+  been unit-tested with the Claude API, embedder, and TTS mocked. Nothing
+  has yet been run against the live Anthropic API by a human with a real
+  key and real course material end to end (ingest → ask/chat in all three
+  modes → generate an audio overview and actually listen to it).
+- **Tune audio prompts after listening.** The coverage-first pipeline is
+  built and unit-tested, but the *quality* of the generated hosts' banter,
+  pacing and tone can only really be judged by listening to a real
+  generated episode and adjusting `notecast/audio/prompts.py` from there.
+- **Optional reranker test on the owner's PC.** `rerank_enabled` is wired up
+  and off by default (see Phase 2 notes in `docs/LEARN.md`); worth an eval
+  run on a second real course to see if it earns its keep before ever
+  turning it on by default.
+- **Quiz / flashcards (Phase 8).** Not started; see the Phase 8 idea list in
+  `docs/LEARN.md`.

@@ -322,14 +322,225 @@ slide *range* **covers** the expected slide number, not just whether it
 equals it — a good example of a bug that was in the measurement, not the
 thing being measured.
 
-**Phase 3 — Grounded chat.** Coming soon.
+**Phase 3 — Grounded chat.** Built the Claude client, the sources-only
+system prompt, citation mapping, and `notecast ask` / `notecast chat`.
 
-**Phase 4 — Modes (Open / Deep).** Coming soon.
+*`search_result` blocks, and why they're better than "just ask Claude to
+cite its sources".* You could just paste your chunks into the prompt as
+plain text and ask Claude to write `[1]`, `[2]` markers, then try to match
+those markers back to the right chunk yourself with string parsing. That's
+fragile — the model can miscount, skip a marker, or cite something it
+didn't actually use. NoteCast instead sends each retrieved chunk as a
+`search_result` content block (a native Claude API feature), and Claude
+returns **structured citations**: each part of its answer comes back tagged
+with exactly which block (and which sentence-range inside it) it's based
+on. There's no marker-parsing to get wrong, and every citation is
+guaranteed to point at real content NoteCast actually sent.
 
-**Phase 5 — Multi-notebook.** Coming soon.
+*The sources-only contract.* In `sources` mode, the system prompt (see
+`notecast/chat/prompts.py`) tells Claude, in plain terms: answer only from
+what's in these search results, don't fill gaps from general knowledge, and
+if the results don't actually answer the question, say so plainly instead
+of guessing. To make that check reliable rather than hoping Claude phrases
+it consistently, the prompt asks for an exact marker token,
+`[NOT_IN_SOURCES]`, as the very first thing in the reply when this happens.
+NoteCast looks for that literal token, strips it out, and shows you a
+friendly "Not in your course material" instead — same idea as the
+`[NOT_IN_SOURCES]` you'll see mentioned in `docs/USAGE.md`, just translated
+into a message a student reads, not a tag the code reads.
 
-**Phase 6 — Audio overview.** Coming soon.
+*Open mode and web search.* `open` mode uses the same retrieval step, but
+adds Claude's own general knowledge and a server-side `web_search` tool it
+can call itself when your notes don't cover something. The system prompt
+requires Claude to keep these three separate in its answer — course
+material, the web, and its own uncited knowledge — so you always know how
+much to trust a given sentence.
 
-**Phase 7 — UI.** Coming soon.
+*Query rewriting for follow-ups.* Search works on a single query string,
+but chat is multi-turn: "and what about the second one?" means nothing to a
+search index on its own. Before every retrieval, a small, cheap Haiku 4.5
+call rewrites the latest message into a standalone query using the recent
+conversation as context ("what about the second one?" → "what is the second
+smoothing technique mentioned"), without touching what actually gets shown
+to you — only the search step sees the rewritten version.
 
-**Phase 8 — Extras.** Coming soon.
+*Prompt caching, and the bug where it made things worse, not better.*
+**Prompt caching** lets you tell Claude's API "remember this exact block of
+input for a few minutes so a later request that starts with the same bytes
+doesn't have to pay full price for it again" — cache writes cost 1.25x the
+normal input price, but a cache *read* only costs about a tenth of it. The
+saving only shows up if the same content is actually resent unchanged on a
+later call. The first version of chat caching got this backwards: it placed
+the cache breakpoint on that turn's *search results* — which are different
+almost every question, since retrieval returns whatever's most relevant to
+that specific question. That meant NoteCast was paying the 25% write
+premium on nearly every question and almost never getting a matching cache
+read back, i.e. caching was making chat slightly *more* expensive than not
+caching at all. The fix moved the cache breakpoint onto the **conversation
+history** instead — the growing list of past questions and answers, which
+*is* genuinely stable and byte-identical from one turn to the next within a
+session. Now the part that repeats gets cached, and the part that changes
+every time (this turn's search results) doesn't pay a write premium it'll
+rarely recoup.
+
+**Phase 4 — Modes (Open / Deep).** Built `deep` mode: full-course context
+with caching, plus its pre-flight cost estimate.
+
+*Why sending the whole course works here.* Top-k retrieval is great for a
+focused question but can miss things for a question like "compare lecture 2
+and lecture 5" or "list every assumption made this unit" — the right
+answer needs pieces scattered across many chunks, more than any reasonable
+top-k would fetch. Current Claude models have a **1-million-token context
+window**, and this course's *entire* material is only around 47,000 tokens
+— small enough to just send everything, every time, and let Claude read all
+of it rather than guess which handful of chunks matter. That's specific to
+a course being this size; it wouldn't make sense for a course ten times
+larger, which is why deep mode is opt-in and shows a token/cost estimate
+first (see `notecast/chat/session.py`'s `estimate_deep_cost`) rather than
+being the default.
+
+*Caching the material.* The whole-course material is sent once, as
+`search_result` blocks, with a cache breakpoint on the end of it. The first
+question in a scope pays the cache-write premium on all of it (≈$0.12 for
+this course, on Sonnet 5); every follow-up question in the same scope reads
+it back from cache instead (≈$0.01). If you change the scope (a different
+`--week` filter, say), the material is different, so the cache doesn't
+apply and NoteCast rebuilds and re-attaches it fresh.
+
+*The citations-dropped bug the verifier caught.* Deep mode's citation
+mapper needs the list of chunks that were actually sent, in order, to turn
+each citation index Claude returns back into a real file/slide/timestamp.
+The first version of deep mode called that mapper with an **empty** chunk
+list instead of the ordered material it had just sent — so every citation
+Claude returned was silently thrown away, and deep-mode answers came back
+with no citations at all, no error, nothing visibly wrong unless you
+noticed the citations were simply missing. The fix keeps the ordered chunk
+list stored alongside the cached material blocks (rather than reconstructing
+or forgetting it) and passes that same list to the citation mapper, so
+citation indices resolve against the chunks Claude was actually shown.
+
+**Phase 5 — Multi-notebook.** A "notebook" was always just a folder under
+`notebooks/<slug>/` with its own `sources/`, its own LanceDB table, and its
+own manifest — so "multi-notebook support" is mostly already true by
+construction rather than a separate system to build. This phase added the
+small pieces that make switching between courses convenient day to day:
+`notecast notebooks create` / `notecast notebooks list` to manage them
+without touching the filesystem by hand, and the `--week` / source-path
+scope filters used throughout `search`, `ask`, `chat` and `audio` so a
+question or an audio overview can be scoped to part of a course instead of
+always meaning "the whole notebook".
+
+**Phase 6 — Audio overview.** Built the key-point extraction, ranking,
+adaptive-length planner, two-host scriptwriter, coverage check, and Kokoro
+TTS rendering.
+
+*Why coverage-first, not top-k, for a summary.* Retrieval answers "which
+chunks are most *similar* to this query" — great for a question, wrong tool
+for a summary, where the goal is the opposite: make sure nothing important
+gets left out, even things that don't closely resemble each other. So the
+audio pipeline is built around **coverage** end to end: extract every
+concept worth knowing first, rank it, budget time for it, then check
+afterwards that the ranked points actually made it into the script —
+rather than trusting a single generation pass to remember everything.
+
+*The five (really seven) steps.* 1) **Key points**: one cheap Haiku 4.5
+call per source file lists every concept, definition, method, worked
+example and caveat, each scored for importance (explicit lecturer emphasis,
+time spent on it, appearing in *both* slides and transcript, assessment
+mentions). 2) **Merge + rank**: one Sonnet 5 call dedupes those across all
+sources and sorts them into Tier A (must cover), B (cover briefly), C
+(mention or skip). 3) **Budget**: turn the tier counts into a time budget
+(≈90s per A point, 30s per B, clamped 5–45 minutes) — compress B points
+first if it'd run long, never drop an A point. 4) **Outline into chapters**.
+5) **Script chapter by chapter**, each call given the full material plus a
+running summary so two hosts (one explains, one asks the questions a
+student would actually ask) stay consistent across the episode. 6)
+**Coverage check**: a Haiku 4.5 pass verifies every Tier A point is
+genuinely explained somewhere in the script, and regenerates any chapter
+that missed one. 7) **TTS**: Kokoro renders each line locally and the
+result is stitched into one MP3 with chapter markers.
+
+*Structured outputs.* Both the key-point extraction and the merge/rank step
+ask Claude for validated JSON (a fixed shape — a list of points with named
+fields) rather than free-form prose to parse with regex, so the rest of the
+pipeline can trust the shape of what comes back instead of guessing at it.
+
+*Why a coverage check at all.* Even with a good outline, a single
+generation pass can quietly skip something — the model runs out of room in
+a chapter, or just doesn't get to a point it was supposed to cover. Treating
+the script as "done" without checking would mean occasionally shipping an
+episode that never actually explains something you were told is important.
+The coverage check is a second, independent pass whose only job is to
+verify that, so gaps get caught and fixed automatically instead of only
+being caught by you noticing something's missing after listening.
+
+*Bugs the verifier caught here:*
+- **Truncated JSON.** A chapter script is written in one Claude call with a
+  fixed `max_tokens` budget. When a chapter's script actually needed more
+  room than that budget, the response got cut off mid-JSON and the whole
+  call crashed trying to parse it, instead of failing gracefully or getting
+  more room. The fix checks the response's `stop_reason`: on a genuine
+  length cutoff, it retries once with a larger `max_tokens` and an added
+  "be more concise" instruction, and it sizes the *initial* `max_tokens`
+  from the chapter's own target word count in the first place (so most
+  chapters never need the retry at all), with a friendly error if it still
+  doesn't fit after retrying.
+- **Silent coverage drop.** The coverage checker returns two lists —
+  "covered" and "missing" tier-A point ids — but the first version only
+  acted on what was in "missing", so a point the model simply left out of
+  *both* lists (neither confirmed covered nor flagged missing) vanished
+  from tracking entirely and never got fixed. The fix stopped trusting the
+  model's own "missing" list at all: anything not explicitly confirmed
+  present in "covered" now counts as missing, so a point can't slip through
+  by being left out of both.
+- **Week order.** Course order (for both the audio outline and deep mode's
+  material) is supposed to be week 1, week 2, ... week 10, but the first
+  version sorted chunks by source file *path* first, and a folder named
+  `week-10/` sorts alphabetically before `week-2/` (because the character
+  `"1"` is less than `"2"`), so week 10's material was read before week 2's.
+  The fix sorts by the numeric week number first, and only falls back to
+  file path as a tie-breaker within the same week.
+- **Key-point merge retry format.** `merge_and_rank` normally asks the SDK
+  to validate its JSON reply against a pydantic model directly. Its retry
+  path (used when the first attempt's output didn't parse) instead built
+  the expected reply format by hand, without `additionalProperties: false`,
+  which let the model's retry response drift from the shape the rest of the
+  pipeline expected. The fix has the retry go through the same path as the
+  first attempt — passing the pydantic model itself to the SDK's
+  `messages.stream(output_format=...)` — so both attempts get the same
+  strict, validated schema instead of the retry using a looser hand-built
+  one.
+
+**Phase 7 — UI.** Built the Streamlit web UI: notebook picker, chat, and
+audio generation, on top of the same core the CLI uses.
+
+*Streamlit reruns, in plain terms.* Streamlit's programming model is
+unusual if you're used to a normal app: it doesn't have persistent "event
+handlers" — instead, the **entire page script re-runs top to bottom** every
+time you interact with anything (click a button, type in a box, change a
+dropdown). State that should survive between reruns (which notebook is
+selected, the chat history so far, a cached retriever) has to be explicitly
+stashed in `st.session_state`; anything else resets on every interaction.
+
+*Why paid actions sit behind buttons and confirmations.* Because the whole
+script reruns on almost any interaction, if generating an audio overview or
+asking a deep-mode question just happened as a normal part of the script
+running top to bottom, it would risk firing again on some unrelated rerun
+(you resize a widget, you type another character somewhere else) — an
+accidental extra charge to your API key for something you didn't actually
+ask for again. The UI avoids this the same way the CLI's `--yes` flag does:
+anything that spends API money only happens inside a button's own click
+handler (which only runs on that specific click, not on every rerun), and
+for deep mode / audio generation it shows the same cost estimate and asks
+for confirmation first, exactly like the CLI does.
+
+**Phase 8 — Extras (ideas).**
+- Quiz / flashcards / study-guide generation from a notebook's material,
+  using the same coverage-first approach as audio (make sure every
+  important point gets a question, not just whatever the model thinks of
+  first).
+- Optional Whisper transcription (for lectures you only have as audio/video,
+  not already-transcribed) and OCR (for scanned/handwritten slides) — both
+  dropped from the original scope to keep Phase 1 simple, revisit later.
+- Try the optional reranker (already wired up, off by default) against a
+  second real course to see if it's worth turning on generally.

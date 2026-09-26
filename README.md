@@ -10,7 +10,12 @@ Drop your lectures, workshops, tutorials, slides, and transcripts into a per-cou
 
 There's no chat attachment limit because your material lives in a local index. Claude only sees the passages relevant to each question, or a whole week's content when that's what the task needs.
 
-> **Status:** Phase 2 (search) in progress — ingest works; see [`docs/LEARN.md`](docs/LEARN.md). See [`docs/PLAN.md`](docs/PLAN.md) for the architecture, build phases, and open decisions.
+> **Status:** Phases 0–6 done (ingest, search, grounded chat in sources/open/deep
+> modes, multi-notebook support, and audio overviews). Phase 7 (the Streamlit
+> web UI) is built and in verification. See [`docs/LEARN.md`](docs/LEARN.md)
+> for the plain-English write-up of how each phase works, and
+> [`docs/PLAN.md`](docs/PLAN.md) for the architecture, build-phase status, and
+> open decisions.
 
 ## How it works (short version)
 
@@ -67,12 +72,22 @@ If you already have `uv` installed:
 
 ```bash
 uv sync
-cp .env.example .env                 # add ANTHROPIC_API_KEY later, not needed yet
+cp .env.example .env                 # then add ANTHROPIC_API_KEY (see docs/SETUP-WINDOWS.md)
+
 uv run notecast notebooks create comp3000
-# copy your files into notebooks/comp3000/sources/
-uv run notecast notebooks list
-uv run notecast --help
+# copy your files into notebooks/comp3000/sources/, e.g. sources/week-01/
+
+uv run notecast ingest comp3000      # parse + index (first run downloads the embedding model)
+uv run notecast ask comp3000 "What is TF-IDF?"
+uv run notecast chat comp3000 --mode deep      # whole-course context, shows a cost estimate first
+uv run notecast audio comp3000 --week 1        # generate a two-host audio overview
+
+uv run streamlit run notecast/ui/app.py        # local web UI: chat + audio, same core as the CLI
 ```
+
+For the full day-to-day guide (every command, all three chat modes,
+what the audio pipeline does, a cost cheat-sheet, and troubleshooting), see
+**[`docs/USAGE.md`](docs/USAGE.md)**.
 
 ## Privacy
 
