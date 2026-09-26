@@ -53,6 +53,10 @@ class Location(BaseModel):
 
     page: int | None = None
     slide: int | None = None
+    # When a chunk spans several consecutive pages/slides (e.g. a title-only
+    # slide folded into the next one), the last page/slide of the range.
+    page_end: int | None = None
+    slide_end: int | None = None
     heading_path: list[str] = Field(default_factory=list)
     t_start: float | None = None
     t_end: float | None = None
@@ -70,9 +74,15 @@ class Location(BaseModel):
         """
         parts: list[str] = []
         if self.page is not None:
-            parts.append(f"p. {self.page}")
+            if self.page_end is not None and self.page_end != self.page:
+                parts.append(f"pp. {self.page}–{self.page_end}")
+            else:
+                parts.append(f"p. {self.page}")
         if self.slide is not None:
-            parts.append(f"slide {self.slide}")
+            if self.slide_end is not None and self.slide_end != self.slide:
+                parts.append(f"slides {self.slide}–{self.slide_end}")
+            else:
+                parts.append(f"slide {self.slide}")
         if self.heading_path:
             parts.append(" › ".join(self.heading_path))
         if self.t_start is not None:
@@ -84,6 +94,18 @@ class Location(BaseModel):
         elif self.approx_minute is not None:
             parts.append(f"≈ {int(self.approx_minute)} min")
         return ", ".join(parts)
+
+    def covers_slide(self, n: int) -> bool:
+        """True if slide `n` falls within this location's slide (or slide range)."""
+        if self.slide is None:
+            return False
+        return self.slide <= n <= (self.slide_end or self.slide)
+
+    def covers_page(self, n: int) -> bool:
+        """True if page `n` falls within this location's page (or page range)."""
+        if self.page is None:
+            return False
+        return self.page <= n <= (self.page_end or self.page)
 
 
 class Section(BaseModel):
