@@ -7,13 +7,23 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import click
 import typer
 
 from notecast import __version__
+from notecast.audio.models import AudioScope, AudioScript
+from notecast.audio.render import estimate_render_seconds
+from notecast.audio.service import generate_overview, render_saved_script
+from notecast.audio.tts import InvalidVoiceError, TTSUnavailableError
+from notecast.chat.client import ChatError, MissingApiKeyError
+from notecast.chat.models import ChatAnswer, ChatMode
+from notecast.chat.session import ChatSession
+from notecast.config import get_settings
 from notecast.eval.retrieval import format_report, load_eval_cases, run_retrieval_eval
 from notecast.index.embedder import EmbedderUnavailableError
 from notecast.index.service import IndexNotBuiltError, get_retriever, index_notebook
 from notecast.index.store import IndexMismatchError, SearchMode
+from notecast.ingest.course import display_name, load_course_config
 from notecast.models import SearchFilters
 from notecast.notebook import Notebook
 
@@ -66,15 +76,6 @@ def notebooks_create(slug: str) -> None:
         raise typer.Exit(code=1) from None
     typer.echo(f"Created notebook {slug!r}. Drop your course files into:")
     typer.echo(f"  {notebook.sources_dir}")
-
-
-def _not_implemented(slug: str, phase: int) -> None:
-    try:
-        Notebook(slug)
-    except ValueError as exc:
-        typer.echo(f"Could not use notebook: {exc}")
-        raise typer.Exit(code=1) from None
-    typer.echo(f"Not implemented yet — coming in Phase {phase}.")
 
 
 def _load_notebook_or_exit(slug: str) -> Notebook:
@@ -217,16 +218,266 @@ def eval_cmd(
     typer.echo(format_report(report))
 
 
+def _make_filters(weeks: list[int]) -> SearchFilters | None:
+    return SearchFilters(weeks=list(weeks)) if weeks else None
+
+
+def _print_answer(answer: ChatAnswer) -> None:
+    typer.echo(answer.text)
+    if answer.not_in_sources:
+        typer.secho("Not in your course material.", fg=typer.colors.YELLOW)
+    if answer.citations:
+        typer.echo("")
+        typer.echo("Sources:")
+        typer.echo(answer.citations_markdown())
+    usage = answer.usage
+    total_tokens = usage.input_tokens + usage.output_tokens
+    cost = f"${usage.est_cost_usd:.4f}" if usage.est_cost_usd is not None else "n/a"
+    typer.echo("")
+    typer.secho(f"[{total_tokens} tokens, est cost {cost}]", dim=True)
+
+
+def _get_retriever_or_exit(notebook: Notebook):  # noqa: ANN201
+    try:
+        return get_retriever(notebook)
+    except IndexNotBuiltError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from None
+
+
+def _make_chat_session(notebook: Notebook, retriever) -> ChatSession:  # noqa: ANN001
+    course_name = display_name(notebook, load_course_config(notebook))
+    try:
+        return ChatSession(retriever, course_name=course_name)
+    except MissingApiKeyError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from None
+
+
+@app.command("ask")
+def ask(
+    slug: str,
+    question: str,
+    mode: ChatMode = typer.Option(  # noqa: B008
+        "sources", "--mode", help="sources or open."
+    ),
+    week: list[int] = typer.Option(  # noqa: B008
+        None, "--week", help="Restrict to this week (repeatable)."
+    ),
+    k: int = typer.Option(None, "-k", help="Number of chunks to retrieve."),  # noqa: B008
+) -> None:
+    """Ask a single grounded question of a notebook's material."""
+    notebook = _load_notebook_or_exit(slug)
+    retriever = _get_retriever_or_exit(notebook)
+    session = _make_chat_session(notebook, retriever)
+
+    try:
+        answer = session.ask(question, mode=mode, filters=_make_filters(week), k=k)
+    except MissingApiKeyError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from None
+    except ChatError as exc:
+        typer.echo(f"Chat failed: {exc}")
+        raise typer.Exit(code=1) from None
+
+    _print_answer(answer)
+
+
+_CHAT_HELP = "Commands: /mode sources|open, /week N (or /week all), /reset, /quit"
+
+
 @app.command("chat")
-def chat(slug: str) -> None:
-    """Chat with a notebook's material. (Phase 3)"""
-    _not_implemented(slug, phase=3)
+def chat(
+    slug: str,
+    mode: ChatMode = typer.Option(  # noqa: B008
+        "sources", "--mode", help="sources or open."
+    ),
+    week: list[int] = typer.Option(  # noqa: B008
+        None, "--week", help="Restrict to this week (repeatable)."
+    ),
+) -> None:
+    """Chat interactively with a notebook's material."""
+    notebook = _load_notebook_or_exit(slug)
+    retriever = _get_retriever_or_exit(notebook)
+    session = _make_chat_session(notebook, retriever)
+
+    current_mode: ChatMode = mode
+    filters = _make_filters(week)
+    total_cost = 0.0
+
+    typer.echo(f"Chatting with {slug!r} (mode: {current_mode}).")
+    typer.echo(_CHAT_HELP)
+
+    while True:
+        try:
+            line = click.prompt("you", prompt_suffix="> ")
+        except (EOFError, click.exceptions.Abort):
+            typer.echo("")
+            break
+
+        line = line.strip()
+        if not line:
+            continue
+
+        if line in ("/quit", "/exit"):
+            break
+        if line == "/reset":
+            session.reset()
+            typer.echo("History cleared.")
+            continue
+        if line.startswith("/mode"):
+            parts = line.split()
+            if len(parts) == 2 and parts[1] in ("sources", "open"):
+                current_mode = parts[1]  # type: ignore[assignment]
+                typer.echo(f"Mode set to {current_mode}.")
+            else:
+                typer.echo("Usage: /mode sources|open")
+            continue
+        if line.startswith("/week"):
+            parts = line.split()
+            if len(parts) == 2 and parts[1] == "all":
+                filters = None
+                typer.echo("Week filter cleared.")
+            elif len(parts) == 2 and parts[1].isdigit():
+                filters = SearchFilters(weeks=[int(parts[1])])
+                typer.echo(f"Restricted to week {parts[1]}.")
+            else:
+                typer.echo("Usage: /week N or /week all")
+            continue
+
+        try:
+            answer = session.ask(line, mode=current_mode, filters=filters)
+        except (MissingApiKeyError, ChatError) as exc:
+            typer.echo(f"Error: {exc}")
+            continue
+        except ValueError as exc:
+            typer.echo(str(exc))
+            continue
+
+        _print_answer(answer)
+        if answer.usage.est_cost_usd:
+            total_cost += answer.usage.est_cost_usd
+
+    typer.echo(f"Total est cost this session: ${total_cost:.4f}")
+
+
+def _print_plan_summary(script: AudioScript) -> None:
+    plan = script.plan
+    tier_a = sum(1 for point in plan.points if point.tier == "A")
+    tier_b = sum(1 for point in plan.points if point.tier == "B")
+
+    typer.echo("")
+    typer.echo(script.title)
+    typer.echo(f"Target length: {plan.target_minutes:.1f} min, {len(plan.chapters)} chapters")
+    typer.echo(f"Tier A points: {tier_a}, Tier B points: {tier_b}")
+    for chapter in plan.chapters:
+        typer.echo(f"  {chapter.index}. {chapter.title}")
+    if plan.notes:
+        typer.echo("Notes: " + "; ".join(plan.notes))
+
+    coverage = script.coverage
+    typer.echo(
+        f"Coverage: {len(coverage.covered)} covered, {len(coverage.missing)} missing, "
+        f"{len(coverage.patched)} patched"
+    )
+    if coverage.missing:
+        typer.echo("  Still missing: " + ", ".join(coverage.missing))
+
+
+def _progress_echo(stage: str, fraction: float) -> None:
+    typer.echo(f"[{fraction * 100:5.1f}%] {stage}")
 
 
 @app.command("audio")
-def audio(slug: str) -> None:
-    """Generate an audio overview for a notebook. (Phase 6)"""
-    _not_implemented(slug, phase=6)
+def audio(
+    slug: str,
+    week: list[int] = typer.Option(  # noqa: B008
+        None, "--week", help="Restrict to this week (repeatable)."
+    ),
+    source: list[str] = typer.Option(  # noqa: B008
+        None, "--source", help="Restrict to this source path (repeatable)."
+    ),
+    focus: str | None = typer.Option(
+        None, "--focus", help="Optional focus, e.g. 'exam prep' or 'just the maths'."
+    ),
+    script_only: bool = typer.Option(
+        False, "--script-only", help="Write the script but don't render audio."
+    ),
+    minutes_max: int | None = typer.Option(
+        None, "--minutes-max", help="Override the maximum length (minutes) for this run."
+    ),
+) -> None:
+    """Generate an audio overview for a notebook."""
+    notebook = _load_notebook_or_exit(slug)
+    settings = get_settings()
+    if minutes_max is not None:
+        settings = settings.model_copy(update={"audio_max_minutes": minutes_max})
+
+    scope = AudioScope(
+        weeks=list(week) if week else None,
+        source_paths=list(source) if source else None,
+        focus=focus,
+    )
+
+    try:
+        result = generate_overview(
+            notebook, scope, settings=settings, render=False, progress=_progress_echo
+        )
+    except MissingApiKeyError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from None
+    except IndexNotBuiltError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from None
+    except ValueError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from None
+    except ChatError as exc:
+        typer.echo(f"Audio generation failed: {exc}")
+        raise typer.Exit(code=1) from None
+
+    _print_plan_summary(result.script)
+    typer.echo(f"Estimated API cost: ${result.est_cost_usd:.4f}")
+    typer.echo(f"Script saved to: {result.script_json_path}")
+
+    if script_only:
+        return
+
+    est_seconds = estimate_render_seconds(result.script)
+    typer.echo(f"Estimated render time: ~{est_seconds:.0f}s")
+
+    try:
+        render_result = render_saved_script(
+            notebook, result.script_json_path, settings=settings, progress=_progress_echo
+        )
+    except (TTSUnavailableError, InvalidVoiceError) as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from None
+
+    typer.echo(f"Audio: {render_result.mp3_path}")
+    typer.echo(f"Transcript: {render_result.transcript_path}")
+    typer.echo(f"Script JSON: {result.script_json_path}")
+
+
+@app.command("audio-render")
+def audio_render(slug: str, script_json: Path) -> None:
+    """Re-render a previously saved script (no Claude API calls)."""
+    notebook = _load_notebook_or_exit(slug)
+    if not script_json.exists():
+        typer.echo(f"No script file at {script_json}")
+        raise typer.Exit(code=1)
+
+    try:
+        render_result = render_saved_script(notebook, script_json, progress=_progress_echo)
+    except IndexNotBuiltError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from None
+    except (TTSUnavailableError, InvalidVoiceError) as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from None
+
+    typer.echo(f"Audio: {render_result.mp3_path}")
+    typer.echo(f"Transcript: {render_result.transcript_path}")
 
 
 if __name__ == "__main__":
