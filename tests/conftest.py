@@ -12,6 +12,14 @@ import pytest
 from notecast.config import get_settings
 
 
+@pytest.fixture(autouse=True)
+def _default_provider_anthropic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Most tests were written against the Anthropic provider. Pin it via the
+    environment; tests for AgentAUS pass `provider="agentaus"` explicitly.
+    """
+    monkeypatch.setenv("NOTECAST_PROVIDER", "anthropic")
+
+
 @pytest.fixture
 def tmp_notebooks_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """A temporary directory to use as the notebooks root, with settings

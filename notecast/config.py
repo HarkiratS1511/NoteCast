@@ -10,16 +10,21 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     """Configuration for NoteCast, read from the environment and `.env`.
 
-    Every field is read as `NOTECAST_<FIELD_NAME>`, except `anthropic_api_key`,
-    which is read as the plain `ANTHROPIC_API_KEY` (matching the common
-    convention used by the Anthropic SDK and most other tools).
+    Every field is read as `NOTECAST_<FIELD_NAME>`, except the API keys and
+    AgentAUS base URL, which are also read as plain `ANTHROPIC_API_KEY`,
+    `AGENTAUS_API_KEY` and `AGENTAUS_BASE_URL`.
+
+    `provider` picks the LLM backend. With `provider="agentaus"`, any of
+    `chat_model` / `helper_model` / `script_model` / `deep_model` that was not
+    set explicitly is replaced by `agentaus_model` (or `agentaus_helper_model`
+    for the helper), so the Claude defaults are never sent to AgentAUS.
     """
 
     model_config = SettingsConfigDict(
@@ -33,6 +38,32 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("ANTHROPIC_API_KEY", "NOTECAST_ANTHROPIC_API_KEY"),
     )
+    # LLM backend: "agentaus" (Trellis Data's sovereign, OpenAI-compatible API)
+    # or "anthropic" (Claude). See docs/AGENTAUS.md.
+    provider: Literal["anthropic", "agentaus"] = "agentaus"
+    agentaus_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AGENTAUS_API_KEY", "NOTECAST_AGENTAUS_API_KEY"),
+    )
+    # OpenAI-compatible base URL, including the /v1 suffix.
+    agentaus_base_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AGENTAUS_BASE_URL", "NOTECAST_AGENTAUS_BASE_URL"),
+    )
+    # Model ID used for every role unless a role's model is set explicitly.
+    agentaus_model: str | None = None
+    # Optional cheaper/faster model for query rewriting and helper calls.
+    agentaus_helper_model: str | None = None
+    # Model context window; deep mode refuses material that won't fit.
+    agentaus_context_tokens: int = 128_000
+    # Cap applied to every request's max_tokens (servers reject larger values).
+    agentaus_max_output_tokens: int = 8192
+    # Send response_format={"type": "json_object"} when JSON is required.
+    agentaus_json_mode: bool = True
+    agentaus_timeout_seconds: float = 600.0
+    # Optional prices (USD per million tokens) for cost estimates.
+    agentaus_price_input_per_mtok: float | None = None
+    agentaus_price_output_per_mtok: float | None = None
     notebooks_dir: Path = Path("notebooks")
     chat_model: str = "claude-sonnet-5"
     helper_model: str = "claude-haiku-4-5"
@@ -64,6 +95,18 @@ class Settings(BaseSettings):
     tts_speed: float = 1.0
     tts_lang: str = "en-us"
     audio_mp3_bitrate: int = 96
+
+    @model_validator(mode="after")
+    def _apply_agentaus_models(self) -> Settings:
+        if self.provider != "agentaus" or not self.agentaus_model:
+            return self
+        explicit = self.model_fields_set
+        for field in ("chat_model", "script_model", "deep_model"):
+            if field not in explicit:
+                setattr(self, field, self.agentaus_model)
+        if "helper_model" not in explicit:
+            self.helper_model = self.agentaus_helper_model or self.agentaus_model
+        return self
 
 
 @lru_cache
