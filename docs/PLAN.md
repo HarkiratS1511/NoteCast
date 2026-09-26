@@ -14,6 +14,7 @@ This builds on the original plan (per-course notebooks → ingest → embed → 
 | Course material | **Never in git; the repo is public and the material is copyrighted.** Material lives in `notebooks/<course>/sources/` (git-ignored). Tests use small synthetic fixtures written for this repo. The real-material eval set lives next to the material, at `notebooks/<course>/eval.yaml`, also git-ignored. |
 | Audio | **Two hosts. Length adapts to the material, up to 45 min. Must cover the important points** from both slides and transcripts (see §5). |
 | Branching | Work directly on `main`. |
+| **[new]** LLM provider | **AgentAUS is the default provider on this branch** (`NOTECAST_PROVIDER=agentaus`), talking to Trellis Data's sovereign, OpenAI-compatible API via an adapter (`notecast/providers/openai_compat.py`). Claude remains fully supported (`NOTECAST_PROVIDER=anthropic`). See below and [`docs/AGENTAUS.md`](AGENTAUS.md). |
 
 **First real course:** COMP4650/6490 Document Analysis, weeks 1–3 slide PDFs (61/94/60 pages, ≈65k characters ≈ 16k tokens total). Findings:
 - These are PowerPoint-exported PDFs, so **one PDF page = one slide**, and the PDF parser should chunk per page.
@@ -87,6 +88,44 @@ Top-k retrieval is the wrong tool for summaries, because an overview needs **cov
 6. **Coverage check (Haiku 4.5):** verify every Tier A point is actually explained in the script, then regenerate the chapter for any that are missed. Produce a coverage report.
 7. **TTS:** Kokoro, via **`kokoro-onnx`** (ONNX runtime) rather than the PyTorch Kokoro package. [planned, to validate in Phase 6] Same reasoning as the embedder: no CUDA/PyTorch install needed on a fresh Windows machine. Two distinct voices, per-line synthesis, stitched with `pydub` (+ `ffmpeg`) with natural pauses → MP3 plus a transcript with chapter markers and source links.
 
+## [new] AgentAUS provider (branch)
+
+**Decision:** add AgentAUS, a sovereign Australian model from Trellis Data
+with an OpenAI-compatible `/v1` API, as an alternative LLM provider, and
+make it the default on this branch. Claude stays available as a config
+switch (`NOTECAST_PROVIDER=anthropic`). Retrieval (fastembed) and audio TTS
+(Kokoro) are unchanged either way — they never call an LLM.
+
+The adapter (`notecast/providers/openai_compat.py`, `OpenAICompatClient`)
+presents the same interface the rest of NoteCast expects from the Claude
+client, so chat, retrieval, and audio scripting code don't need to branch
+on provider. It emulates the features AgentAUS's API doesn't have natively:
+citations via numbered `<source id="n">` prompts and `[n]` markers mapped
+back to file + page/slide/timestamp, and structured JSON output (audio key
+points, scripts, coverage check) via a described JSON Schema plus
+`response_format={"type": "json_object"}` when
+`NOTECAST_AGENTAUS_JSON_MODE=true`, falling back automatically if the
+server rejects that parameter. `<think>` reasoning blocks in responses are
+stripped before parsing. A new `notecast provider-check` command prints the
+active provider/models, lists what the endpoint offers, and sends a small
+ping request, for confirming the key/base URL/model ID.
+
+**Known trade-offs vs Claude** (see [`docs/AGENTAUS.md`](AGENTAUS.md) for
+the full table):
+- Citations are emulated, not native — the cited span is the whole source
+  excerpt rather than the exact cited sentence.
+- No server-side web search in open mode; open mode with AgentAUS is
+  sources + model knowledge only.
+- No prompt caching, so deep mode resends the full scope every turn —
+  slower and pricier per follow-up than with Claude.
+- Deep mode is capped at `NOTECAST_AGENTAUS_CONTEXT_TOKENS` (default
+  128,000 tokens) instead of Claude's ~1M-token window.
+- Max output per request capped by `NOTECAST_AGENTAUS_MAX_OUTPUT_TOKENS`
+  (default 8192).
+- Cost estimates only show up if `NOTECAST_AGENTAUS_PRICE_INPUT_PER_MTOK` /
+  `..._OUTPUT_PER_MTOK` are set, since AgentAUS pricing isn't wired into
+  NoteCast's defaults the way Claude's is.
+
 ## 6. [new] Evaluation (small but essential)
 
 A `tests/eval/` set of ~20–30 question/answer/source triples per test course, including **questions whose answer is *not* in the material**. We track:
@@ -140,3 +179,9 @@ Phase 1 must be solid before anything else, same as the original plan.
   turning it on by default.
 - **Quiz / flashcards (Phase 8).** Not started; see the Phase 8 idea list in
   `docs/LEARN.md`.
+- **Live test against AgentAUS.** The provider adapter is unit-tested with
+  the API mocked (same as Claude), but nothing has been run against a real
+  AgentAUS endpoint yet — need to confirm the actual context window, max
+  output tokens, and whether `response_format={"type": "json_object"}` is
+  supported, plus get real pricing to fill in
+  `NOTECAST_AGENTAUS_PRICE_INPUT_PER_MTOK` / `..._OUTPUT_PER_MTOK`.

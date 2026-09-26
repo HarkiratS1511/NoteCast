@@ -225,10 +225,15 @@ course's material is (tens of thousands of tokens) — see LEARN.md Phase 4.
 ## Troubleshooting
 
 **"Missing API key" / chat or audio commands fail immediately**
-You need an Anthropic API key in `.env` as `ANTHROPIC_API_KEY=...`. See
+You need an API key for whichever LLM provider is configured. By default
+that's AgentAUS (`NOTECAST_PROVIDER=agentaus`), needing `AGENTAUS_API_KEY`
+and `AGENTAUS_BASE_URL` in `.env` — see
+[`docs/AGENTAUS.md`](AGENTAUS.md). With `NOTECAST_PROVIDER=anthropic` you
+need `ANTHROPIC_API_KEY=...` instead; see
 [`docs/SETUP-WINDOWS.md`](SETUP-WINDOWS.md#getting-an-anthropic-api-key) for
 where to get one. `search` and `ingest` don't need a key — only commands
-that call Claude do.
+that call the LLM do. Run `uv run notecast provider-check` to confirm which
+provider is active and that its key/base URL/model ID actually work.
 
 **"Index not built" / search returns nothing / IndexNotBuiltError**
 Run `uv run notecast ingest <slug>` first. If you've already ingested and

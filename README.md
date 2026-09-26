@@ -15,6 +15,12 @@ There's no chat attachment limit because your material lives in a local index. C
 > real end-to-end run with an API key. See [`docs/LEARN.md`](docs/LEARN.md) and
 > [`docs/PLAN.md`](docs/PLAN.md).
 
+> **This branch:** adds **AgentAUS** (Trellis Data's sovereign, OpenAI-compatible
+> model) as an alternative LLM provider, and it's the default here
+> (`NOTECAST_PROVIDER=agentaus`). Claude is still available
+> (`NOTECAST_PROVIDER=anthropic`). See [`docs/AGENTAUS.md`](docs/AGENTAUS.md)
+> for setup and the differences from Claude.
+
 ## How it works (short version)
 
 ```
@@ -37,7 +43,7 @@ Audio overviews use the same grounding, then script ► Kokoro TTS (two voices) 
 | Parsing | `pymupdf` (PDF), `python-pptx`, `python-docx`, `webvtt-py` / `srt` |
 | Vector store | LanceDB (embedded, built-in full-text search for hybrid retrieval) |
 | Embeddings | `fastembed` (ONNX) running `BAAI/bge-small-en-v1.5` locally — no GPU/PyTorch needed |
-| LLM | Claude API via the official `anthropic` SDK, with native citations, prompt caching, and web search |
+| LLM | AgentAUS (default on this branch) or Claude — see [`docs/AGENTAUS.md`](docs/AGENTAUS.md). Claude uses the official `anthropic` SDK, with native citations, prompt caching, and web search. AgentAUS uses the `openai` SDK against its OpenAI-compatible API, with those features emulated (see the docs page for the differences) |
 | TTS | Kokoro via `kokoro-onnx`, runs locally (free); MP3 via `lameenc` |
 | UI | Streamlit (local web UI) + thin CLI |
 
@@ -70,7 +76,8 @@ If you already have `uv` installed:
 
 ```bash
 uv sync
-cp .env.example .env                 # then add ANTHROPIC_API_KEY (see docs/SETUP-WINDOWS.md)
+cp .env.example .env                 # then add your AgentAUS or Anthropic key (see docs/AGENTAUS.md / docs/SETUP-WINDOWS.md)
+uv run notecast provider-check       # confirm the key, base URL and model ID work
 
 uv run notecast notebooks create comp3000
 # copy your files into notebooks/comp3000/sources/, e.g. sources/week-01/
@@ -93,4 +100,6 @@ Course material, indexes, and generated audio live under `notebooks/` and are
 **git-ignored — they are never committed**, because this repository is
 **public** and your course material is copyrighted. Nothing in that folder
 ever leaves your machine except the specific passages a request needs, sent
-to the Claude API to generate an answer or a script.
+to whichever LLM provider is configured (AgentAUS or Claude) to generate an
+answer or a script. Embeddings and text-to-speech always run locally, on
+either provider.
