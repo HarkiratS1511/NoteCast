@@ -13,6 +13,9 @@ dependencies = [
     "python-docx>=1.2.0",
     "webvtt-py>=0.5.1",
     "srt>=3.5.3",
+    "lancedb>=0.39.0",
+    "fastembed>=0.8.1",
+    "pyarrow>=25.0.1",
 ]
 
 [project.scripts]

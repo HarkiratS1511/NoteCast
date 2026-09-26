@@ -39,8 +39,15 @@ class Settings(BaseSettings):
     script_model: str = "claude-sonnet-5"
     deep_model: str = "claude-sonnet-5"
     embedding_model: str = "BAAI/bge-small-en-v1.5"
+    # "fastembed" = real local ONNX model; "hashing" = tiny offline stand-in (tests only).
+    embedding_backend: Literal["fastembed", "hashing"] = "fastembed"
+    model_cache_dir: Path = Path(".cache/models")
     device: Literal["auto", "cuda", "cpu"] = "auto"
     retrieval_top_k: int = 10
+    # Optional cross-encoder reranker, applied to the top `rerank_candidates` hits.
+    rerank_enabled: bool = False
+    reranker_model: str = "Xenova/ms-marco-MiniLM-L-6-v2"
+    rerank_candidates: int = 30
     audio_max_minutes: int = 45
 
 
