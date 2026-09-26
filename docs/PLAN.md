@@ -10,6 +10,15 @@ This builds on the original plan (per-course notebooks → ingest → embed → 
 | Sources | **PDF, PPTX, DOCX, VTT/SRT/TXT/MD.** Whisper transcription and OCR are dropped from scope (they can go back into Phase 8 later). |
 | Hardware | **Windows/Linux + NVIDIA GPU.** Embeddings, reranker and Kokoro run on CUDA when available and fall back to CPU. `ffmpeg` is a documented prerequisite. |
 | API budget | **Cheapest.** Chat defaults to Sonnet 5, and query rewriting and other helper calls use Haiku 4.5. Audio scripts use Sonnet 5 too. Opus isn't used by default and is a config switch. Deep mode is opt-in and shows an estimated token cost before sending. Prompt caching is on wherever the prefix repeats. |
+| OS / experience | **Windows, fresh setup, learning as we go.** Phase 0 ships `docs/SETUP-WINDOWS.md` (step-by-step installs for uv, Python, ffmpeg, CUDA PyTorch) and `docs/LEARN.md`, a plain-English explainer that grows each phase (what embeddings are, why hybrid search, how citations work). Paths use `pathlib` everywhere and nothing assumes a Unix shell. |
+| Course material | **Never in git; the repo is public and the material is copyrighted.** Material lives in `notebooks/<course>/sources/` (git-ignored). Tests use small synthetic fixtures written for this repo. The real-material eval set lives next to the material (`notebooks/<course>/eval.yaml`), also git-ignored. |
+| Audio | **Two hosts. Length adapts to the material, up to 45 min. Must cover the important points** from both slides and transcripts (see §5). |
+| Branching | Work directly on `main`. |
+
+**First real course:** COMP4650/6490 Document Analysis, weeks 1–3 slide PDFs (61/94/60 pages, ≈65k characters ≈ 16k tokens total). Findings:
+- These are PowerPoint-exported PDFs, so **one PDF page = one slide**, and the PDF parser should chunk per page.
+- Every page has a boilerplate footer ("ANU SCHOOL OF COMPUTING | DOCUMENT ANALYSIS | 12"). The parser must **strip repeated headers/footers** (lines recurring on >50% of pages) but keep the page number as metadata.
+- A full course at this density is roughly 60–80k tokens. That **easily fits in context**, so Deep mode and full-coverage audio scripts are cheap (~$0.15 uncached with Sonnet 5, ~10× less on cache hits). Retrieval is still the default for chat, since it's cheaper per question and gives tighter citations.
 
 ---
 
@@ -61,17 +70,21 @@ notebooks/<course-slug>/
 - Multi-turn: keep chat history. Rewrite follow-ups ("what about the second one?") into standalone queries before retrieval.
 - Model IDs are in config. Defaults (cheapest profile): **Sonnet 5** (`claude-sonnet-5`, $2/$10 per M tokens) for chat, audio scripts and Deep mode; **Haiku 4.5** (`claude-haiku-4-5`) for query rewriting and helper calls. Opus is optional.
 
-## 5. Audio overview [changed: coverage over similarity]
+## 5. Audio overview [changed: coverage-first, adaptive length]
 
-**Top-k retrieval is the wrong tool for summaries.** An overview needs *coverage* of the material, not the chunks most similar to a query. So:
+Top-k retrieval is the wrong tool for summaries, because an overview needs **coverage**, not similarity. The pipeline is built so that nothing important gets skipped:
 
-1. **Select scope:** a week, topic, file set, or whole course, plus an optional focus prompt ("focus on exam-relevant stuff").
-2. **Gather all chunks in scope.** If it fits (usually true with 1M context), send it all. If not, map-reduce: summarise per source, then write the script from the summaries.
-3. **Outline, then script.** Claude writes an outline (key ideas, examples, misconceptions), then a two-host dialogue as **structured JSON** (`[{speaker, text}]`), grounded strictly in the sources. Length target is in minutes (~150 words/min).
-4. **TTS:** Kokoro with two distinct voices (Piper fallback). Synthesise line by line, then `pydub` stitches it with short pauses → MP3 (needs `ffmpeg`).
-5. **[new] Output a transcript with chapter markers** alongside the MP3, with each chapter linked to its sources.
-
-Formats: `deep-dive` (two hosts, 10–20 min), `brief` (one voice, 3–5 min), `exam-review` (Q&A style).
+1. **Scope:** a week, topic, file set, or whole course, plus an optional focus ("exam prep", "just the maths").
+2. **Key-point extraction (map, Haiku 4.5, one call per source):** list every concept, definition, method, worked example and caveat, each with an **importance score** and evidence:
+   - explicit emphasis ("this will be on the exam", "the key idea is…", boxed/bold slide titles)
+   - time the lecturer spends on it in the transcript
+   - whether it appears in **both** the slides and the transcript (strong signal)
+   - assessment mentions (quiz/assignment topics)
+3. **Merge + rank (Sonnet 5):** dedupe across slides and transcripts into one ranked list. Tier A = must cover in depth, Tier B = cover briefly, Tier C = mention or skip.
+4. **Adaptive length:** budget ≈ 90 s per Tier A point + 30 s per Tier B + 1 min intro/outro, **clamped to 5–45 min** (≈150 spoken words/min). If the full budget exceeds 45 min, B points are compressed first, and A points are never dropped. The user can override the length.
+5. **Outline into chapters,** then **script chapter by chapter** (Sonnet 5), each call given the full scope material plus the running summary so the hosts stay consistent. Output is structured JSON `[{speaker, text, sources}]`. Two hosts: one explains, one asks the questions a student would ask, including likely confusions.
+6. **Coverage check (Haiku 4.5):** verify every Tier A point is actually explained in the script, then regenerate the chapter for any that are missed. Produce a coverage report.
+7. **TTS:** Kokoro (CUDA), two distinct voices, per-line synthesis, stitched with `pydub` (+ `ffmpeg`) with natural pauses → MP3 plus a transcript with chapter markers and source links.
 
 ## 6. [new] Evaluation (small but essential)
 
@@ -97,13 +110,13 @@ Parallel tracks are in brackets; they run as simultaneous Sonnet builders.
 
 | Phase | Deliverable | Parallel tracks |
 |---|---|---|
-| **0. Scaffold** | `pyproject` (uv), ruff, pytest, config, `.env.example`, core data models (`Chunk`, `Source`, `Notebook`), and interfaces for parser/embedder/store | single builder |
+| **0. Scaffold** | `pyproject` (uv), ruff, pytest, config, `.env.example`, core data models (`Chunk`, `Source`, `Notebook`), and interfaces for parser/embedder/store | [scaffold+core] [Windows setup + LEARN docs] |
 | **1. Ingestion** | all parsers + chunker + manifest/incremental ingest | [PDF] [PPTX+DOCX] [VTT/SRT/TXT] [chunker+manifest] |
 | **2. Index + retrieval** | embedder, LanceDB store, hybrid search, filters | [embedder] [store+hybrid] [eval harness] |
 | **3. Grounded chat** | Claude client with citations, sources-only mode, citation → location mapping, CLI chat | [claude client+prompts] [citation mapper] [CLI] |
 | **4. Modes** | open mode + web search, Deep (full-context + caching) mode | [web search] [deep mode] |
 | **5. Multi-notebook** | create/list/switch/delete courses, scope filters | single builder |
-| **6. Audio overview** | scope gather → outline → script JSON → Kokoro TTS → stitch | [script gen] [TTS+stitch] |
+| **6. Audio overview** | key points → rank → adaptive outline → chapter scripts → coverage check → Kokoro TTS → stitch | [key points+ranking] [script+coverage] [TTS+stitch] |
 | **7. UI** | chosen front end | depends on choice |
 | **8. Extras** | quiz/flashcards/study guide; later maybe Whisper transcription and OCR | parallel per feature |
 
