@@ -65,6 +65,20 @@ def settings() -> Settings:
     return Settings(_env_file=None, anthropic_api_key="sk-test")
 
 
+def _agentaus_settings(**overrides: Any) -> Settings:
+    defaults: dict[str, Any] = dict(
+        _env_file=None,
+        provider="agentaus",
+        agentaus_api_key="key",
+        agentaus_base_url="https://example.test/v1",
+        agentaus_model="trellis-large",
+        agentaus_price_input_per_mtok=3.0,
+        agentaus_price_output_per_mtok=15.0,
+    )
+    defaults.update(overrides)
+    return Settings(**defaults)
+
+
 # ---------------------------------------------------------------------------
 # Fake Anthropic client
 # ---------------------------------------------------------------------------
@@ -337,6 +351,44 @@ def test_extraction_tracks_usage_and_cost(settings: Settings) -> None:
     assert run.est_cost_usd > 0
 
 
+def test_extraction_tracks_agentaus_cost_when_priced() -> None:
+    settings = _agentaus_settings()
+    chunks = [make_chunk("a.pdf", 0, text="alpha")]
+    response = extraction_response(
+        [{"title": "T", "summary": "S", "source_chunk_ids": [chunks[0].chunk_id]}]
+    )
+    response.usage = FakeUsage(input_tokens=1_000_000, output_tokens=1_000_000)
+    client = FakeClient(create_responses=[response])
+
+    run = KeyPointRun()
+    extract_key_points("a.pdf", chunks, client=client, settings=settings, usage=run)
+
+    # 1M input tokens @ $3/MTok + 1M output tokens @ $15/MTok.
+    assert run.est_cost_usd == pytest.approx(18.0)
+
+
+def test_extraction_agentaus_cost_stays_zero_when_unpriced() -> None:
+    settings = _agentaus_settings(
+        agentaus_price_input_per_mtok=None, agentaus_price_output_per_mtok=None
+    )
+    chunks = [make_chunk("a.pdf", 0, text="alpha")]
+    response = extraction_response(
+        [{"title": "T", "summary": "S", "source_chunk_ids": [chunks[0].chunk_id]}]
+    )
+    response.usage = FakeUsage(input_tokens=1000, output_tokens=200)
+    client = FakeClient(create_responses=[response])
+
+    run = KeyPointRun()
+    extract_key_points("a.pdf", chunks, client=client, settings=settings, usage=run)
+
+    # No AgentAUS prices configured -> estimate_cost returns None for every
+    # call, so the accumulator's cost never advances past its 0.0 default
+    # (KeyPointRun.est_cost_usd is a plain float, not Optional -- see
+    # notecast/audio/keypoints.py::KeyPointRun.add).
+    assert run.calls == 1
+    assert run.est_cost_usd == 0.0
+
+
 # ---------------------------------------------------------------------------
 # merge_and_rank
 # ---------------------------------------------------------------------------
@@ -448,6 +500,21 @@ def test_merge_and_rank_tracks_usage_and_cost(settings: Settings) -> None:
     assert run.input_tokens == 2000
     assert run.output_tokens == 500
     assert run.est_cost_usd > 0
+
+
+def test_merge_and_rank_tracks_agentaus_cost_when_priced() -> None:
+    settings = _agentaus_settings()
+    points_by_source = {"a.pdf": [_key_point("Alpha")]}
+    response = merge_response(
+        [{"title": "Alpha", "summary": "s", "source_chunk_ids": ["c1"], "tier": "A"}]
+    )
+    response.usage = FakeUsage(input_tokens=1_000_000, output_tokens=1_000_000)
+    client = FakeClient(parse_responses=[response])
+
+    run = KeyPointRun()
+    merge_and_rank(points_by_source, client=client, settings=settings, usage=run)
+
+    assert run.est_cost_usd == pytest.approx(18.0)
 
 
 def test_combined_usage_accumulates_across_both_calls(settings: Settings) -> None:

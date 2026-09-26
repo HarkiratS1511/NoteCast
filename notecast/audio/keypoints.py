@@ -69,19 +69,28 @@ MERGE_MAX_TOKENS = 16_000
 class KeyPointRun(BaseModel):
     """Accumulates token usage and estimated cost across `extract_key_points`
     and `merge_and_rank` calls. See module docstring for how it's used.
+
+    `est_cost_usd` stays a plain running total (never `None`) so it's always
+    safe to add to -- check `all_priced` to tell whether that total actually
+    reflects every call (it's `False`, and `est_cost_usd` understates the
+    real spend, once any call's cost couldn't be estimated, e.g. AgentAUS
+    with no configured prices).
     """
 
     calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     est_cost_usd: float = 0.0
+    all_priced: bool = True
 
-    def add(self, model: str, usage: dict[str, Any]) -> None:
+    def add(self, model: str, usage: dict[str, Any], *, settings: Settings | None = None) -> None:
         self.calls += 1
         self.input_tokens += usage.get("input_tokens", 0) or 0
         self.output_tokens += usage.get("output_tokens", 0) or 0
-        cost = estimate_cost(model, usage)
-        if cost is not None:
+        cost = estimate_cost(model, usage, settings=settings)
+        if cost is None:
+            self.all_priced = False
+        else:
             self.est_cost_usd += cost
 
 
@@ -150,6 +159,7 @@ def _invoke_with_retries(
     parse_model: type[BaseModel] | None = None,
     effort: str | None = None,
     usage: KeyPointRun | None = None,
+    settings: Settings | None = None,
 ) -> Any:
     """`_invoke`, plus explicit `stop_reason` handling: "refusal" raises a
     `ChatError` immediately; "max_tokens" logs a warning and retries once
@@ -169,7 +179,7 @@ def _invoke_with_retries(
             effort=effort,
         )
         if usage is not None:
-            usage.add(model, _usage_dict(response))
+            usage.add(model, _usage_dict(response), settings=settings)
         return response
 
     response = call(max_tokens)
@@ -359,6 +369,7 @@ def _extract_part(
                 system=_EXTRACTION_SYSTEM,
                 messages=messages,
                 usage=usage,
+                settings=settings,
             )
         except anthropic.AnthropicError as exc:
             raise map_anthropic_error(exc) from exc
@@ -542,6 +553,7 @@ def merge_and_rank(
                 parse_model=_MergeResult,
                 effort="medium",
                 usage=usage,
+                settings=settings,
             )
         except anthropic.AnthropicError as exc:
             raise map_anthropic_error(exc) from exc

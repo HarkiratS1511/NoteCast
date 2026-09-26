@@ -63,13 +63,21 @@ def _report(progress: _ProgressFn | None, stage: str, fraction: float) -> None:
         progress(stage, fraction)
 
 
+def _kp_cost(kp_usage: KeyPointRun) -> float | None:
+    """`kp_usage.est_cost_usd`, or `None` if any of its calls couldn't be
+    priced (see `KeyPointRun.all_priced`) -- so a caller never mistakes an
+    unpriced run for a free one.
+    """
+    return kp_usage.est_cost_usd if kp_usage.all_priced else None
+
+
 class OverviewFailed(RuntimeError):
     """Raised when the audio pipeline fails after it has already spent some
     API budget, so the caller can tell the user how much was spent and at
     which stage it stopped.
     """
 
-    def __init__(self, stage: str, est_cost_usd: float, message: str) -> None:
+    def __init__(self, stage: str, est_cost_usd: float | None, message: str) -> None:
         self.stage = stage
         self.est_cost_usd = est_cost_usd
         super().__init__(message)
@@ -78,15 +86,19 @@ class OverviewFailed(RuntimeError):
 class OverviewEstimate(BaseModel):
     """A pre-flight cost estimate for `generate_overview`, computed without
     calling Claude. See `estimate_overview_cost` for the model behind it.
+
+    The cost fields are `None` (never a misleading 0.0) when the run can't
+    be priced at all -- currently only AgentAUS with no configured prices;
+    Anthropic's built-in models are always priced.
     """
 
     total_material_tokens: int
     n_sources: int
     n_chapters_low: int
     n_chapters_high: int
-    est_cost_usd: float
-    est_cost_low_usd: float
-    est_cost_high_usd: float
+    est_cost_usd: float | None
+    est_cost_low_usd: float | None
+    est_cost_high_usd: float | None
 
 
 class RenderSavedResult(BaseModel):
@@ -109,7 +121,7 @@ class OverviewResult(BaseModel):
     script: AudioScript
     render: RenderResult | None = None
     script_json_path: Path
-    est_cost_usd: float = 0.0
+    est_cost_usd: float | None = 0.0
     timings: dict[str, float] = Field(default_factory=dict)
 
 
@@ -138,12 +150,14 @@ def _chapter_count_for_minutes(minutes: float) -> int:
     return max(MIN_CHAPTERS, min(MAX_CHAPTERS, round(minutes / _CHAPTERS_PER_MINUTES) or 1))
 
 
-def _chapter_calls_cost(minutes: float, material_tokens: int, settings: Settings) -> float:
+def _chapter_calls_cost(minutes: float, material_tokens: int, settings: Settings) -> float | None:
     """Estimated cost of the chapter-writing calls for a `minutes`-long
     episode: the first chapter call writes `material_tokens` to the prompt
     cache (1.25x the input price), later chapters read it back (0.10x),
     each call also carries a small uncached tail and an output proportional
     to that chapter's target word count.
+
+    Returns `None` (rather than 0.0) if any of these calls can't be priced.
     """
     n_chapters = _chapter_count_for_minutes(minutes)
     target_words = minutes * settings.audio_words_per_minute
@@ -157,7 +171,10 @@ def _chapter_calls_cost(minutes: float, material_tokens: int, settings: Settings
             usage["cache_write_tokens"] = material_tokens
         else:
             usage["cache_read_tokens"] = material_tokens
-        cost += estimate_cost(settings.script_model, usage) or 0.0
+        call_cost = estimate_cost(settings.script_model, usage, settings=settings)
+        if call_cost is None:
+            return None
+        cost += call_cost
     return cost
 
 
@@ -190,46 +207,52 @@ def estimate_overview_cost(
     grouped = group_by_source(selected)
     total_tokens = 0
     extraction_cost = 0.0
+    unpriced = False
     for chunks in grouped.values():
         source_tokens = sum(estimate_tokens(c.embed_text) for c in chunks)
         total_tokens += source_tokens
         n_parts = max(1, math.ceil(source_tokens / MAX_SOURCE_TOKENS))
         for _ in range(n_parts):
-            extraction_cost += (
-                estimate_cost(
-                    settings.helper_model,
-                    {
-                        "input_tokens": source_tokens / n_parts,
-                        "output_tokens": _EXTRACTION_OUTPUT_TOKENS,
-                    },
-                )
-                or 0.0
+            part_cost = estimate_cost(
+                settings.helper_model,
+                {
+                    "input_tokens": source_tokens / n_parts,
+                    "output_tokens": _EXTRACTION_OUTPUT_TOKENS,
+                },
+                settings=settings,
             )
+            if part_cost is None:
+                unpriced = True
+            else:
+                extraction_cost += part_cost
 
-    merge_cost = (
-        estimate_cost(
-            settings.script_model,
-            {"input_tokens": _MERGE_INPUT_TOKENS, "output_tokens": _MERGE_OUTPUT_TOKENS},
-        )
-        or 0.0
+    merge_cost_val = estimate_cost(
+        settings.script_model,
+        {"input_tokens": _MERGE_INPUT_TOKENS, "output_tokens": _MERGE_OUTPUT_TOKENS},
+        settings=settings,
     )
+    unpriced = unpriced or merge_cost_val is None
+    merge_cost = merge_cost_val or 0.0
 
-    coverage_cost_one = (
-        estimate_cost(
-            settings.helper_model,
-            {"input_tokens": _COVERAGE_INPUT_TOKENS, "output_tokens": _COVERAGE_OUTPUT_TOKENS},
-        )
-        or 0.0
+    coverage_cost_one_val = estimate_cost(
+        settings.helper_model,
+        {"input_tokens": _COVERAGE_INPUT_TOKENS, "output_tokens": _COVERAGE_OUTPUT_TOKENS},
+        settings=settings,
     )
+    unpriced = unpriced or coverage_cost_one_val is None
+    coverage_cost_one = coverage_cost_one_val or 0.0
 
     n_chapters_low = _chapter_count_for_minutes(float(settings.audio_min_minutes))
     n_chapters_high = _chapter_count_for_minutes(float(settings.audio_max_minutes))
-    chapters_cost_low = _chapter_calls_cost(
+    chapters_cost_low_val = _chapter_calls_cost(
         float(settings.audio_min_minutes), total_tokens, settings
     )
-    chapters_cost_high = _chapter_calls_cost(
+    chapters_cost_high_val = _chapter_calls_cost(
         float(settings.audio_max_minutes), total_tokens, settings
     )
+    unpriced = unpriced or chapters_cost_low_val is None or chapters_cost_high_val is None
+    chapters_cost_low = chapters_cost_low_val or 0.0
+    chapters_cost_high = chapters_cost_high_val or 0.0
 
     cost_low = extraction_cost + merge_cost + chapters_cost_low + coverage_cost_one
     cost_high = extraction_cost + merge_cost + chapters_cost_high + 2 * coverage_cost_one
@@ -239,9 +262,9 @@ def estimate_overview_cost(
         n_sources=len(grouped),
         n_chapters_low=n_chapters_low,
         n_chapters_high=n_chapters_high,
-        est_cost_usd=(cost_low + cost_high) / 2,
-        est_cost_low_usd=cost_low,
-        est_cost_high_usd=cost_high,
+        est_cost_usd=None if unpriced else (cost_low + cost_high) / 2,
+        est_cost_low_usd=None if unpriced else cost_low,
+        est_cost_high_usd=None if unpriced else cost_high,
     )
 
 
@@ -298,7 +321,7 @@ def generate_overview(
             )
             _report(progress, "key_points", 0.1 + 0.3 * (i + 1) / max(len(sources), 1))
     except (ChatError, ValueError) as exc:
-        raise OverviewFailed("key_points", kp_usage.est_cost_usd, str(exc)) from exc
+        raise OverviewFailed("key_points", _kp_cost(kp_usage), str(exc)) from exc
     timings["key_points"] = time.monotonic() - t
 
     t = time.monotonic()
@@ -307,14 +330,14 @@ def generate_overview(
             points_by_source, client=client, settings=settings, focus=scope.focus, usage=kp_usage
         )
     except (ChatError, ValueError) as exc:
-        raise OverviewFailed("merging", kp_usage.est_cost_usd, str(exc)) from exc
+        raise OverviewFailed("merging", _kp_cost(kp_usage), str(exc)) from exc
     _timed("merging", 0.45, t)
 
     t = time.monotonic()
     try:
         plan = plan_audio(ranked, scope, settings, selected)
     except (ChatError, ValueError) as exc:
-        raise OverviewFailed("planning", kp_usage.est_cost_usd, str(exc)) from exc
+        raise OverviewFailed("planning", _kp_cost(kp_usage), str(exc)) from exc
     _timed("planning", 0.5, t)
 
     t = time.monotonic()
@@ -324,7 +347,12 @@ def generate_overview(
             plan, selected, client=client, settings=settings, course_name=course_name
         )
     except (ChatError, ValueError) as exc:
-        spent = kp_usage.est_cost_usd + getattr(exc, "partial_est_cost_usd", 0.0)
+        # `partial_est_cost_usd` defaults to 0.0 (not None) when the
+        # exception carries no such attribute at all -- that means "no
+        # extra spend beyond kp_usage", not "unknown spend".
+        partial = getattr(exc, "partial_est_cost_usd", 0.0)
+        kp_cost = _kp_cost(kp_usage)
+        spent = None if kp_cost is None or partial is None else kp_cost + partial
         raise OverviewFailed("scripting", spent, str(exc)) from exc
     _timed("scripting", 0.8, t)
 
@@ -332,7 +360,10 @@ def generate_overview(
     script_json_path = _save_script(nb, script)
     _timed("saving_script", 0.82, t)
 
-    est_cost_usd = kp_usage.est_cost_usd + (script.est_cost_usd or 0.0)
+    kp_cost = _kp_cost(kp_usage)
+    est_cost_usd = (
+        None if kp_cost is None or script.est_cost_usd is None else kp_cost + script.est_cost_usd
+    )
 
     render_result: RenderResult | None = None
     if render:

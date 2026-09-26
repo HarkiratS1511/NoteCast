@@ -533,10 +533,17 @@ def audio(
         typer.echo(str(exc))
         raise typer.Exit(code=1) from None
 
-    typer.echo(
-        f"Estimated cost: ~${estimate.est_cost_usd:.4f} "
-        f"(range ${estimate.est_cost_low_usd:.4f}–${estimate.est_cost_high_usd:.4f})"
-    )
+    if (
+        estimate.est_cost_usd is None
+        or estimate.est_cost_low_usd is None
+        or estimate.est_cost_high_usd is None
+    ):
+        typer.echo(f"Estimated cost: {_format_cost_or_na(None)}")
+    else:
+        typer.echo(
+            f"Estimated cost: ~${estimate.est_cost_usd:.4f} "
+            f"(range ${estimate.est_cost_low_usd:.4f}–${estimate.est_cost_high_usd:.4f})"
+        )
     if not yes and not typer.confirm("Continue?"):
         typer.echo("Cancelled.")
         raise typer.Exit(code=1)
@@ -553,7 +560,8 @@ def audio(
         raise typer.Exit(code=1) from None
     except OverviewFailed as exc:
         typer.echo(
-            f"Audio generation failed at {exc.stage}: {exc} (spent ~${exc.est_cost_usd:.4f})"
+            f"Audio generation failed at {exc.stage}: {exc} "
+            f"(spent ~{_format_cost_or_na(exc.est_cost_usd)})"
         )
         raise typer.Exit(code=1) from None
     except ValueError as exc:
@@ -564,7 +572,7 @@ def audio(
         raise typer.Exit(code=1) from None
 
     _print_plan_summary(result.script)
-    typer.echo(f"Estimated API cost: ${result.est_cost_usd:.4f}")
+    typer.echo(f"Estimated API cost: {_format_cost_or_na(result.est_cost_usd)}")
     typer.echo(f"Script saved to: {result.script_json_path}")
 
     if script_only:

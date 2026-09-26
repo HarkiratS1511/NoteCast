@@ -765,6 +765,82 @@ def test_audio_script_only_prints_plan_summary(
     assert str(result_obj.script_json_path) in result.output
 
 
+def test_audio_estimate_shows_na_when_agentaus_unpriced(
+    tmp_notebooks_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the pre-flight estimate can't be priced (AgentAUS with no
+    configured prices), the CLI should say "n/a", not print "None" or
+    crash trying to format it with `:.4f`.
+    """
+    import notecast.cli as cli_mod
+
+    Notebook.create("my-course", root=tmp_notebooks_root)
+    monkeypatch.setattr(
+        cli_mod,
+        "estimate_overview_cost",
+        lambda nb, scope, settings: _fake_estimate(
+            est_cost_usd=None, est_cost_low_usd=None, est_cost_high_usd=None
+        ),
+    )
+
+    def _boom(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        raise AssertionError("generate_overview should not run before confirmation is answered")
+
+    monkeypatch.setattr(cli_mod, "generate_overview", _boom)
+
+    result = runner.invoke(app, ["audio", "my-course", "--week", "1", "--script-only"], input="n\n")
+
+    assert "Estimated cost: n/a (set NOTECAST_AGENTAUS_PRICE_* to estimate)" in result.output
+    assert "None" not in result.output
+
+
+def test_audio_result_shows_na_cost_when_agentaus_unpriced(
+    tmp_notebooks_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import notecast.cli as cli_mod
+
+    notebook = Notebook.create("my-course", root=tmp_notebooks_root)
+    result_obj = _fake_overview_result(notebook, render=False)
+    result_obj.est_cost_usd = None
+
+    monkeypatch.setattr(
+        cli_mod, "estimate_overview_cost", lambda nb, scope, settings: _fake_estimate()
+    )
+
+    def _fake_generate_overview(nb, scope, *, settings=None, render=True, progress=None, **kw):  # noqa: ANN001
+        return result_obj
+
+    monkeypatch.setattr(cli_mod, "generate_overview", _fake_generate_overview)
+
+    result = runner.invoke(app, ["audio", "my-course", "--week", "1", "--script-only", "--yes"])
+
+    assert result.exit_code == 0
+    assert "Estimated API cost: n/a (set NOTECAST_AGENTAUS_PRICE_* to estimate)" in result.output
+
+
+def test_audio_failure_shows_na_spend_when_agentaus_unpriced(
+    tmp_notebooks_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import notecast.cli as cli_mod
+    from notecast.audio.service import OverviewFailed
+
+    Notebook.create("my-course", root=tmp_notebooks_root)
+    monkeypatch.setattr(
+        cli_mod, "estimate_overview_cost", lambda nb, scope, settings: _fake_estimate()
+    )
+
+    def _raise_failed(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        raise OverviewFailed("scripting", None, "boom while scripting")
+
+    monkeypatch.setattr(cli_mod, "generate_overview", _raise_failed)
+
+    result = runner.invoke(app, ["audio", "my-course", "--week", "1", "--script-only", "--yes"])
+
+    assert result.exit_code == 1
+    assert "failed at scripting" in result.output
+    assert "spent ~n/a (set NOTECAST_AGENTAUS_PRICE_* to estimate)" in result.output
+
+
 def test_audio_requires_confirmation_without_yes(
     tmp_notebooks_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

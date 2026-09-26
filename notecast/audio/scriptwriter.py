@@ -169,7 +169,12 @@ def write_script(
         # any coverage calls) before re-raising, so a caller that lost the
         # rest of the episode to this failure can still report accurately
         # what was actually spent, rather than $0.
-        exc.partial_est_cost_usd = _estimate_total_cost(usage_by_model) or 0.0  # type: ignore[attr-defined]
+        # `None` here (rather than 0.0) means the calls made so far genuinely
+        # can't be priced (e.g. AgentAUS with no configured prices) -- the
+        # caller must not treat that as "spent nothing".
+        exc.partial_est_cost_usd = _estimate_total_cost(  # type: ignore[attr-defined]
+            usage_by_model, settings
+        )
         raise
 
     coverage = CoverageReport(
@@ -179,7 +184,7 @@ def write_script(
         notes=notes,
     )
 
-    est_cost_usd = _estimate_total_cost(usage_by_model)
+    est_cost_usd = _estimate_total_cost(usage_by_model, settings)
 
     title = f"{course_name} — {plan.scope.label()}" if course_name else plan.scope.label()
 
@@ -582,11 +587,24 @@ def _accumulate_usage(totals: dict[str, int], addition: dict[str, int]) -> None:
         totals[key] += addition.get(key, 0)
 
 
-def _estimate_total_cost(usage_by_model: dict[str, dict[str, int]]) -> float | None:
+def _estimate_total_cost(
+    usage_by_model: dict[str, dict[str, int]], settings: Settings | None = None
+) -> float | None:
+    """Sum `estimate_cost(...)` across every model that made at least one
+    call in `usage_by_model`, or `None` if any of those models' calls
+    couldn't be priced (e.g. AgentAUS with no configured prices).
+
+    No calls at all (an empty `usage_by_model`, e.g. a failure on the very
+    first chapter before any usage was recorded) is 0.0, not `None` --
+    there's genuinely nothing to price yet, which is different from having
+    calls whose cost is unknown.
+    """
+    if not usage_by_model:
+        return 0.0
     total = 0.0
     have_cost = False
     for model, usage in usage_by_model.items():
-        cost = estimate_cost(model, usage)
+        cost = estimate_cost(model, usage, settings=settings)
         if cost is not None:
             have_cost = True
             total += cost

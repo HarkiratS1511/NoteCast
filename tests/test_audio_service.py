@@ -155,7 +155,11 @@ class FakePipeline:
     ) -> list[KeyPoint]:
         self.extract_calls += 1
         if usage is not None:
-            usage.add("claude-haiku-4-5", {"input_tokens": 100, "output_tokens": 50})
+            usage.add(
+                settings.helper_model,
+                {"input_tokens": 100, "output_tokens": 50},
+                settings=settings,
+            )
         return [_fake_key_point(chunks[0], "x")] if chunks else []
 
     def merge_and_rank(
@@ -169,7 +173,11 @@ class FakePipeline:
     ) -> list[RankedKeyPoint]:
         self.merge_calls += 1
         if usage is not None:
-            usage.add("claude-sonnet-5", {"input_tokens": 200, "output_tokens": 100})
+            usage.add(
+                settings.script_model,
+                {"input_tokens": 200, "output_tokens": 100},
+                settings=settings,
+            )
         return _fake_ranked(points_by_source)
 
     def plan_audio(
@@ -324,6 +332,25 @@ def test_cost_is_summed_from_key_points_and_script(
     assert result.est_cost_usd == pytest.approx(expected_kp_cost + 0.02)
 
 
+def test_cost_is_none_when_agentaus_key_point_calls_are_unpriced(
+    notebook: Notebook, pipeline: FakePipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When AgentAUS has no configured prices, `kp_usage` can't be priced
+    (`KeyPointRun.all_priced` is False), so the overall result is `None`,
+    not just the fake script's own (still non-None) 0.02 -- an unknown
+    part of the spend makes the whole total unknown.
+    """
+    _patch_retriever(monkeypatch, _sample_chunks())
+    scope = AudioScope(weeks=[1])
+    settings = _agentaus_settings(
+        agentaus_price_input_per_mtok=None, agentaus_price_output_per_mtok=None
+    )
+
+    result = generate_overview(notebook, scope, client=object(), settings=settings, render=False)
+
+    assert result.est_cost_usd is None
+
+
 # --- estimate_overview_cost ---------------------------------------------
 
 
@@ -341,6 +368,54 @@ def test_estimate_overview_cost_returns_a_range(
     assert estimate.n_chapters_low >= 3
     assert estimate.n_chapters_high <= 8
     assert estimate.n_chapters_low <= estimate.n_chapters_high
+
+
+def _agentaus_settings(**overrides: Any) -> Any:
+    from notecast.config import Settings
+
+    defaults: dict[str, Any] = dict(
+        _env_file=None,
+        provider="agentaus",
+        agentaus_api_key="key",
+        agentaus_base_url="https://example.test/v1",
+        agentaus_model="trellis-large",
+        agentaus_price_input_per_mtok=3.0,
+        agentaus_price_output_per_mtok=15.0,
+    )
+    defaults.update(overrides)
+    return Settings(**defaults)
+
+
+def test_estimate_overview_cost_agentaus_priced_is_positive(
+    notebook: Notebook, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_retriever(monkeypatch, _sample_chunks())
+    scope = AudioScope(weeks=[1, 2])
+    settings = _agentaus_settings()
+
+    estimate = service.estimate_overview_cost(notebook, scope, settings)
+
+    assert 0 < estimate.est_cost_low_usd <= estimate.est_cost_usd <= estimate.est_cost_high_usd
+
+
+def test_estimate_overview_cost_agentaus_unpriced_is_none(
+    notebook: Notebook, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With AgentAUS prices unset, every underlying `estimate_cost(...)`
+    call returns `None`, so the whole estimate is `None` -- "n/a" once
+    the CLI/UI render it -- rather than a misleading $0.00.
+    """
+    _patch_retriever(monkeypatch, _sample_chunks())
+    scope = AudioScope(weeks=[1, 2])
+    settings = _agentaus_settings(
+        agentaus_price_input_per_mtok=None, agentaus_price_output_per_mtok=None
+    )
+
+    estimate = service.estimate_overview_cost(notebook, scope, settings)
+
+    assert estimate.est_cost_low_usd is None
+    assert estimate.est_cost_usd is None
+    assert estimate.est_cost_high_usd is None
 
 
 def test_estimate_overview_cost_empty_scope_raises(
@@ -420,6 +495,106 @@ def test_generate_overview_scripting_failure_includes_partial_script_spend(
         estimate_cost("claude-haiku-4-5", {"input_tokens": 100, "output_tokens": 50}) or 0.0
     ) + (estimate_cost("claude-sonnet-5", {"input_tokens": 200, "output_tokens": 100}) or 0.0)
     assert err.est_cost_usd == pytest.approx(expected_kp_cost + 0.4321)
+
+
+def test_generate_overview_scripting_refusal_on_chapter_1_keeps_kp_cost_for_anthropic(
+    notebook: Notebook, pipeline: FakePipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a *real* `write_script` failing on its very first
+    chapter call records no usage at all, so its `partial_est_cost_usd`
+    must be 0.0 (see notecast.audio.scriptwriter._estimate_total_cost) --
+    not `None`, which would wrongly wipe out the already-known,
+    already-priced key-point/merge spend for an ordinary Anthropic run.
+    """
+    import notecast.audio.scriptwriter as scriptwriter_module
+
+    # Let the real write_script run (instead of the pipeline fixture's
+    # fake), against a fake Anthropic client that refuses chapter 1.
+    monkeypatch.setattr(service, "write_script", scriptwriter_module.write_script)
+
+    class _FakeStreamContext:
+        def __init__(self, message: dict) -> None:
+            self._message = message
+
+        def __enter__(self) -> _FakeStreamContext:
+            return self
+
+        def __exit__(self, *exc: Any) -> bool:
+            return False
+
+        def get_final_message(self) -> dict:
+            return self._message
+
+    class _FakeMessages:
+        def stream(self, **kwargs: Any) -> _FakeStreamContext:
+            return _FakeStreamContext(
+                {
+                    "content": [],
+                    "stop_reason": "refusal",
+                    "stop_details": {"category": "policy"},
+                    "usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                }
+            )
+
+        def create(self, **kwargs: Any) -> dict:  # pragma: no cover - coverage check unreachable
+            raise AssertionError("coverage check should not run: chapter 1 already failed")
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.messages = _FakeMessages()
+
+    _patch_retriever(monkeypatch, _sample_chunks())
+    scope = AudioScope(weeks=[1])
+
+    with pytest.raises(service.OverviewFailed) as exc_info:
+        generate_overview(notebook, scope, client=_FakeClient(), render=False)
+
+    err = exc_info.value
+    assert err.stage == "scripting"
+    # Only key-point/merge spend -- write_script itself spent nothing
+    # (partial_est_cost_usd == 0.0, not None) since chapter 1 refused
+    # before any usage was recorded.
+    expected_kp_cost = (
+        estimate_cost("claude-haiku-4-5", {"input_tokens": 100, "output_tokens": 50}) or 0.0
+    ) + (estimate_cost("claude-sonnet-5", {"input_tokens": 200, "output_tokens": 100}) or 0.0)
+    assert err.est_cost_usd == pytest.approx(expected_kp_cost)
+
+
+def test_generate_overview_failure_est_cost_is_none_when_agentaus_unpriced(
+    notebook: Notebook, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure's `est_cost_usd` should be `None`, not 0.0, when the spend
+    so far genuinely can't be priced (AgentAUS with no configured prices) --
+    0.0 would wrongly claim the run so far was free.
+    """
+    _patch_retriever(monkeypatch, _sample_chunks())
+    scope = AudioScope(weeks=[1])
+    settings = _agentaus_settings(
+        agentaus_price_input_per_mtok=None, agentaus_price_output_per_mtok=None
+    )
+
+    def _spendy_extract(source_path, chunks, *, client, settings, focus=None, usage=None):  # noqa: ANN001
+        if usage is not None:
+            usage.add(
+                settings.helper_model,
+                {"input_tokens": 1000, "output_tokens": 200},
+                settings=settings,
+            )
+        raise service.ChatError("boom during extraction")
+
+    monkeypatch.setattr(service, "extract_key_points", _spendy_extract)
+
+    with pytest.raises(service.OverviewFailed) as exc_info:
+        generate_overview(notebook, scope, client=object(), settings=settings, render=False)
+
+    err = exc_info.value
+    assert err.stage == "key_points"
+    assert err.est_cost_usd is None
 
 
 def test_generate_overview_scripting_failure_without_partial_cost_defaults_to_zero(

@@ -215,11 +215,25 @@ _LINES_CH2 = [
 ]
 
 
-def _full_coverage_run(client: FakeClient) -> Any:
-    settings = _settings()
+def _full_coverage_run(client: FakeClient, settings: Settings | None = None) -> Any:
+    settings = settings or _settings()
     return write_script(
         _plan(), _chunks(), client=client, settings=settings, course_name="COMP4650"
     )
+
+
+def _agentaus_settings(**overrides: Any) -> Settings:
+    defaults: dict[str, Any] = dict(
+        _env_file=None,
+        provider="agentaus",
+        agentaus_api_key="key",
+        agentaus_base_url="https://example.test/v1",
+        agentaus_model="trellis-large",
+        agentaus_price_input_per_mtok=3.0,
+        agentaus_price_output_per_mtok=15.0,
+    )
+    defaults.update(overrides)
+    return Settings(**defaults)
 
 
 # --- Tests -----------------------------------------------------------------
@@ -444,6 +458,44 @@ def test_cost_accumulates_across_calls_including_cache_tokens() -> None:
     assert script.est_cost_usd == pytest.approx(expected)
 
 
+def test_agentaus_cost_priced_when_prices_configured() -> None:
+    settings = _agentaus_settings()
+    client = FakeClient(
+        stream_responses=[
+            _chapter_message(_LINES_CH1, input_tokens=1_000_000, output_tokens=1_000_000),
+            _chapter_message(_LINES_CH2, input_tokens=0, output_tokens=0),
+        ],
+        create_responses=[_coverage_message(["kp-1", "kp-3"], [], input_tokens=0, output_tokens=0)],
+    )
+
+    script = _full_coverage_run(client, settings)
+
+    # 1M input tokens @ $3/MTok + 1M output tokens @ $15/MTok, all other
+    # calls' usage is zeroed out above.
+    assert script.est_cost_usd == pytest.approx(18.0)
+
+
+def test_agentaus_cost_is_none_when_prices_unset() -> None:
+    settings = _agentaus_settings(
+        agentaus_price_input_per_mtok=None, agentaus_price_output_per_mtok=None
+    )
+    client = FakeClient(
+        stream_responses=[
+            _chapter_message(_LINES_CH1, input_tokens=1000, output_tokens=200),
+            _chapter_message(_LINES_CH2, input_tokens=1000, output_tokens=200),
+        ],
+        create_responses=[
+            _coverage_message(["kp-1", "kp-3"], [], input_tokens=300, output_tokens=50)
+        ],
+    )
+
+    script = _full_coverage_run(client, settings)
+
+    # No AgentAUS prices configured -> the whole run is unpriced, so
+    # est_cost_usd is None, not $0.00.
+    assert script.est_cost_usd is None
+
+
 def test_title_uses_course_name_and_scope_label() -> None:
     client = FakeClient(
         stream_responses=[
@@ -595,6 +647,49 @@ def test_refusal_on_chapter_3_of_4_reports_partial_spend_for_chapters_1_and_2() 
     # (refused) chapter and the coverage check never ran.
     assert len(client.messages.stream_calls) == 3
     assert len(client.messages.create_calls) == 0
+
+
+def test_refusal_on_chapter_1_before_any_usage_reports_zero_partial_cost() -> None:
+    """A failure on the very first chapter, before any usage was ever
+    recorded, has genuinely spent nothing so far -- `partial_est_cost_usd`
+    should be 0.0, not `None` (which would wrongly read as "unknown spend"
+    for an ordinary, always-priced Anthropic run).
+    """
+    client = FakeClient(
+        stream_responses=[
+            _chapter_message([], stop_reason="refusal", stop_details={"category": "policy"}),
+        ],
+        create_responses=[],
+    )
+
+    with pytest.raises(ChatError) as exc_info:
+        _full_coverage_run(client)
+
+    assert exc_info.value.partial_est_cost_usd == 0.0
+
+
+def test_agentaus_unpriced_refusal_after_usage_reports_none_partial_cost() -> None:
+    """The AgentAUS-unpriced counterpart: once at least one call's usage
+    *was* recorded but can't be priced, `partial_est_cost_usd` must stay
+    `None`, not collapse to 0.0.
+    """
+    settings = _agentaus_settings(
+        agentaus_price_input_per_mtok=None, agentaus_price_output_per_mtok=None
+    )
+    client = FakeClient(
+        stream_responses=[
+            _chapter_message(
+                _LINES_CH1, input_tokens=100, output_tokens=50
+            ),  # chapter 1 succeeds, usage recorded
+            _chapter_message([], stop_reason="refusal", stop_details={"category": "policy"}),
+        ],
+        create_responses=[],
+    )
+
+    with pytest.raises(ChatError) as exc_info:
+        _full_coverage_run(client, settings)
+
+    assert exc_info.value.partial_est_cost_usd is None
 
 
 def test_chapter_max_tokens_exhausted_after_retry_raises_chat_error() -> None:
