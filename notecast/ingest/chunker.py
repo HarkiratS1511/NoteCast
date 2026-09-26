@@ -216,9 +216,15 @@ def _combine_slide_chunks(chunks: list[_RawChunk]) -> _RawChunk:
     first, last = chunks[0], chunks[-1]
     text = "\n\n".join(c.text for c in chunks if c.text.strip())
     title = last.title or first.title
+    location = first.location.model_copy()
+    if last.end_num is not None:
+        if location.slide is not None:
+            location.slide_end = last.end_num
+        elif location.page is not None:
+            location.page_end = last.end_num
     return _RawChunk(
         text=text,
-        location=first.location,
+        location=location,
         title=title,
         is_slide=True,
         start_num=first.start_num,
@@ -289,7 +295,6 @@ def _build_header(
     doc: ParsedDocument,
     section_title: str | None,
     location: Location,
-    location_label: str | None = None,
 ) -> str:
     parts: list[str] = []
     if course_name:
@@ -302,7 +307,7 @@ def _build_header(
         parts.append(section_title)
     if doc.metadata.get("kind") in _TRANSCRIPT_KINDS:
         parts.append("Lecture transcript")
-    label = location_label if location_label is not None else location.label()
+    label = location.label()
     if label:
         parts.append(label)
     return " · ".join(p for p in parts if p)
@@ -399,22 +404,12 @@ def chunk_document(
     for item in raw:
         if not item.text.strip():
             continue
-        location_label: str | None = None
-        if (
-            item.is_slide
-            and item.start_num is not None
-            and item.end_num is not None
-            and item.start_num != item.end_num
-        ):
-            unit = "pages" if item.location.page is not None else "slides"
-            location_label = f"{unit} {item.start_num}–{item.end_num}"
         header = _build_header(
             course_name=course_name,
             week=week,
             doc=doc,
             section_title=item.title,
             location=item.location,
-            location_label=location_label,
         )
         chunk_id = Chunk.make_id(course, doc.source_path, ordinal, item.text)
         chunks.append(

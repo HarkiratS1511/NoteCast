@@ -59,6 +59,49 @@ class TestLocationLabel:
     def test_empty_location(self) -> None:
         assert Location().label() == ""
 
+    def test_slide_range(self) -> None:
+        assert Location(slide=4, slide_end=6).label() == "slides 4–6"
+
+    def test_slide_end_equal_to_slide_renders_single(self) -> None:
+        assert Location(slide=4, slide_end=4).label() == "slide 4"
+
+    def test_page_range(self) -> None:
+        assert Location(page=2, page_end=3).label() == "pp. 2–3"
+
+    def test_page_end_equal_to_page_renders_single(self) -> None:
+        assert Location(page=2, page_end=2).label() == "p. 2"
+
+
+class TestLocationCovers:
+    def test_covers_slide_within_range(self) -> None:
+        loc = Location(slide=4, slide_end=6)
+        assert loc.covers_slide(4)
+        assert loc.covers_slide(5)
+        assert loc.covers_slide(6)
+
+    def test_covers_slide_outside_range(self) -> None:
+        loc = Location(slide=4, slide_end=6)
+        assert not loc.covers_slide(3)
+        assert not loc.covers_slide(7)
+
+    def test_covers_slide_no_range_matches_only_exact(self) -> None:
+        loc = Location(slide=4)
+        assert loc.covers_slide(4)
+        assert not loc.covers_slide(5)
+
+    def test_covers_slide_none_never_covers(self) -> None:
+        assert not Location().covers_slide(4)
+
+    def test_covers_page_within_range(self) -> None:
+        loc = Location(page=2, page_end=3)
+        assert loc.covers_page(2)
+        assert loc.covers_page(3)
+        assert not loc.covers_page(1)
+        assert not loc.covers_page(4)
+
+    def test_covers_page_none_never_covers(self) -> None:
+        assert not Location().covers_page(2)
+
 
 class TestChunkMakeId:
     def test_stable(self) -> None:

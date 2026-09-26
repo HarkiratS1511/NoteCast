@@ -277,6 +277,7 @@ def test_tiny_slide_merges_forward_into_next_slide() -> None:
     chunks = _chunk(doc)
     assert len(chunks) == 1
     assert chunks[0].location.slide == 1
+    assert chunks[0].location.slide_end == 2
     assert "Overview" in chunks[0].text
     assert _real_slide(2) in chunks[0].text
     assert chunks[0].header.endswith("slides 1–2")
@@ -292,6 +293,7 @@ def test_tiny_slide_at_end_merges_backward() -> None:
     chunks = _chunk(doc)
     assert len(chunks) == 1
     assert chunks[0].location.slide == 1
+    assert chunks[0].location.slide_end == 2
     assert _real_slide(1) in chunks[0].text
     assert "Questions?" in chunks[0].text
     assert chunks[0].header.endswith("slides 1–2")
@@ -308,6 +310,7 @@ def test_two_consecutive_tiny_slides_merge_into_next_real_slide() -> None:
     chunks = _chunk(doc)
     assert len(chunks) == 1
     assert chunks[0].location.slide == 1
+    assert chunks[0].location.slide_end == 3
     assert chunks[0].header.endswith("slides 1–3")
     for text in ("Overview", "Part Two", _real_slide(3)):
         assert text in chunks[0].text
@@ -329,12 +332,14 @@ def test_tiny_slide_run_is_capped_at_three() -> None:
     # backward into the already-full group of 3, so it stands alone.
     assert len(chunks) == 2
     assert chunks[0].location.slide == 1
+    assert chunks[0].location.slide_end == 3
     assert chunks[0].header.endswith("slides 1–3")
     for text in ("A", "B", "C"):
         assert text in chunks[0].text
     assert "D" not in chunks[0].text
 
     assert chunks[1].location.slide == 4
+    assert chunks[1].location.slide_end is None
     assert chunks[1].text == "D"
     assert chunks[1].header.endswith("slide 4")
 
@@ -343,6 +348,7 @@ def test_non_tiny_slides_keep_normal_single_slide_label() -> None:
     doc = _doc([Section(text=_real_slide(1), location=Location(slide=1))])
     chunks = _chunk(doc)
     assert len(chunks) == 1
+    assert chunks[0].location.slide_end is None
     assert chunks[0].header.endswith("slide 1")
     assert "slides" not in chunks[0].header
 

@@ -160,6 +160,25 @@ def test_expected_source_matches_slides() -> None:
     assert not expect.matches(other_source)
 
 
+def test_expected_source_matches_merged_slide_range() -> None:
+    expect = ExpectedSource(source="week-02/*.pdf", slides=[6])
+    chunk = Chunk(
+        chunk_id=Chunk.make_id("course", "week-02/x.pdf", 0, "text"),
+        course="course",
+        source_path="week-02/x.pdf",
+        source_type="pdf",
+        ordinal=0,
+        text="text",
+        location=Location(slide=4, slide_end=6),
+    )
+    assert expect.matches(chunk)
+
+
+def test_expected_source_rejects_reversed_minutes() -> None:
+    with pytest.raises(ValueError, match="minutes range"):
+        ExpectedSource(source="*", minutes=(20.0, 10.0))
+
+
 def test_expected_source_matches_pages() -> None:
     expect = ExpectedSource(source="*.pdf", pages=[3, 4])
     assert expect.matches(make_chunk("x.pdf", "text", page=3))

@@ -34,7 +34,11 @@ class ExpectedSource(BaseModel):
 
     A chunk matches this expectation when its `source_path` matches the
     `source` glob AND every constraint provided (slides/pages/contains/
-    minutes) holds for that chunk.
+    minutes) holds for that chunk. `slides`/`pages` match if the chunk's
+    location *covers* any of the listed numbers (via `covers_slide`/
+    `covers_page`), so a chunk folded from a merged slide/page range (e.g.
+    slide=4, slide_end=6) matches an expectation naming any slide in 4-6,
+    not only its first slide.
     """
 
     source: str
@@ -43,12 +47,22 @@ class ExpectedSource(BaseModel):
     contains: list[str] | None = None
     minutes: tuple[float, float] | None = None
 
+    @model_validator(mode="after")
+    def _check_minutes(self) -> ExpectedSource:
+        if self.minutes is not None:
+            lo, hi = self.minutes
+            if lo > hi:
+                raise ValueError(
+                    f"minutes range must have lo <= hi, got ({lo}, {hi}) for source {self.source!r}"
+                )
+        return self
+
     def matches(self, chunk: Chunk) -> bool:
         if not fnmatch.fnmatch(chunk.source_path, self.source):
             return False
-        if self.slides is not None and chunk.location.slide not in self.slides:
+        if self.slides is not None and not any(chunk.location.covers_slide(n) for n in self.slides):
             return False
-        if self.pages is not None and chunk.location.page not in self.pages:
+        if self.pages is not None and not any(chunk.location.covers_page(n) for n in self.pages):
             return False
         if self.contains is not None:
             text_lower = chunk.text.lower()
@@ -65,7 +79,13 @@ class ExpectedSource(BaseModel):
 
 
 class EvalCase(BaseModel):
-    """One question in an eval set, with the sources that should answer it."""
+    """One question in an eval set, with the sources that should answer it.
+
+    `weeks` restricts the search to those weeks via `SearchFilters`. `None`
+    (the field left unset) also means no filter. An explicit empty list
+    (`weeks: []`) is likewise treated as no filter — `run_retrieval_eval`
+    only builds a `SearchFilters(weeks=...)` when `weeks` is truthy.
+    """
 
     id: str
     question: str
@@ -168,6 +188,11 @@ def run_retrieval_eval(
 ) -> RetrievalEvalReport:
     """Run every answerable case's question through `retriever.search()` and
     score where (if at all) a matching chunk shows up in the top k.
+
+    `hit_at_5` and `hit_at_k` are computed independently, but since a rank
+    can never be found beyond how many hits `retriever.search()` returned
+    (bounded by `k`), `hit_at_5` equals `hit_at_k` whenever `k < 5` --
+    there's nothing past position `k` for the wider cutoff to catch.
     """
     results: list[CaseResult] = []
     for case in cases:
