@@ -54,6 +54,16 @@ class Settings(BaseSettings):
     reranker_model: str = "Xenova/ms-marco-MiniLM-L-6-v2"
     rerank_candidates: int = 30
     audio_max_minutes: int = 45
+    audio_min_minutes: int = 5
+    # Spoken pace used to turn a time budget into a word budget.
+    audio_words_per_minute: int = 150
+    # Local text-to-speech (Kokoro via ONNX). Voices: see docs/LEARN.md.
+    tts_model: Literal["fp32", "int8"] = "fp32"
+    host_a_voice: str = "af_heart"
+    host_b_voice: str = "bm_george"
+    tts_speed: float = 1.0
+    tts_lang: str = "en-us"
+    audio_mp3_bitrate: int = 96
 
 
 @lru_cache

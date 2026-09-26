@@ -17,6 +17,8 @@ dependencies = [
     "fastembed>=0.8.1",
     "pyarrow>=25.0.1",
     "anthropic>=1.8.0",
+    "kokoro-onnx>=0.6.1",
+    "lameenc>=1.8.4",
 ]
 
 [project.scripts]
