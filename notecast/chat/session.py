@@ -28,8 +28,15 @@ from notecast.models import Chunk, SearchFilters, SearchHit
 
 _MAX_PAUSE_CONTINUATIONS = 3
 _QUERY_REWRITE_MAX_TOKENS = 200
-# Deep mode: refuse to send material estimated over this many input tokens.
-_MAX_DEEP_TOKENS = 600_000
+# Deep mode: refuse to send material estimated over this many input tokens
+# (Anthropic; AgentAUS derives its own limit from the model's context window
+# -- see `ChatSession._max_deep_tokens`).
+_ANTHROPIC_MAX_DEEP_TOKENS = 600_000
+# Safety margin subtracted from AgentAUS's context window, on top of the
+# reserved output budget, when deriving its deep-mode token limit.
+_AGENTAUS_DEEP_SAFETY_MARGIN_TOKENS = 4_000
+# Never let the derived AgentAUS limit collapse to (or below) zero.
+_MIN_DEEP_TOKENS_FLOOR = 1_000
 # Rough per-chunk JSON overhead (title, source, block wrapper) added on top
 # of the chunk's own text when estimating deep mode's material size.
 _DEEP_OVERHEAD_TOKENS_PER_CHUNK = 20
@@ -172,6 +179,41 @@ class ChatSession:
             total += _DEEP_OVERHEAD_TOKENS_PER_CHUNK
         return total
 
+    def _max_deep_tokens(self) -> int:
+        """The most material (in estimated input tokens) deep mode will
+        send for the current provider.
+
+        Anthropic keeps the fixed historical cap. AgentAUS instead derives
+        its limit from the configured model's context window, minus the
+        output tokens a request reserves and a small safety margin -- and
+        never returns less than a small positive floor.
+        """
+        if self.settings.provider != "agentaus":
+            return _ANTHROPIC_MAX_DEEP_TOKENS
+        reserved_output = min(
+            self.settings.chat_max_tokens, self.settings.agentaus_max_output_tokens
+        )
+        limit = (
+            self.settings.agentaus_context_tokens
+            - reserved_output
+            - _AGENTAUS_DEEP_SAFETY_MARGIN_TOKENS
+        )
+        return max(limit, _MIN_DEEP_TOKENS_FLOOR)
+
+    def _deep_token_limit_message(self, tokens: int, limit: int) -> str:
+        if self.settings.provider == "agentaus":
+            return (
+                f"The material in scope is about {tokens:,} tokens, over deep mode's "
+                f"{limit:,}-token limit for {self.settings.deep_model} "
+                f"(context window: {self.settings.agentaus_context_tokens:,} tokens). "
+                "Narrow the scope (fewer weeks or files) and try again."
+            )
+        return (
+            f"The material in scope is about {tokens:,} tokens, over deep mode's "
+            f"{limit:,}-token limit. Narrow the scope (fewer weeks or "
+            "files) and try again."
+        )
+
     def _deep_scope_chunks(self, filters: SearchFilters | None) -> tuple[list[Chunk], int]:
         """Fetch and order the chunks in scope for deep mode, and estimate
         their token size. Raises ChatError if there's no chunk source, or
@@ -184,12 +226,9 @@ class ChatSession:
         if not ordered:
             raise ChatError("Nothing in scope for deep mode — check the week filter")
         tokens = self._estimate_material_tokens(ordered)
-        if tokens > _MAX_DEEP_TOKENS:
-            raise ChatError(
-                f"The material in scope is about {tokens:,} tokens, over deep mode's "
-                f"{_MAX_DEEP_TOKENS:,}-token limit. Narrow the scope (fewer weeks or "
-                "files) and try again."
-            )
+        limit = self._max_deep_tokens()
+        if tokens > limit:
+            raise ChatError(self._deep_token_limit_message(tokens, limit))
         return ordered, tokens
 
     def estimate_deep_cost(self, filters: SearchFilters | None = None) -> tuple[int, float]:

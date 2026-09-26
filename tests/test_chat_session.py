@@ -800,6 +800,81 @@ def test_switching_from_sources_to_deep_citations_map_to_deep_material() -> None
     assert deep_answer.citations[0].source_path == "w1/a.vtt"
 
 
+def _agentaus_settings(**overrides: Any) -> Settings:
+    defaults = dict(
+        _env_file=None,
+        provider="agentaus",
+        agentaus_api_key="key",
+        agentaus_base_url="https://example.test/v1",
+        agentaus_model="trellis-large",
+        agentaus_context_tokens=128_000,
+        agentaus_max_output_tokens=8192,
+        chat_max_tokens=8000,
+        deep_model="trellis-large",
+    )
+    defaults.update(overrides)
+    return Settings(**defaults)
+
+
+def test_agentaus_max_deep_tokens_derived_from_context_window() -> None:
+    chunk_source = FakeChunkSource([])
+    session = ChatSession(
+        FakeRetriever([]),
+        settings=_agentaus_settings(),
+        client=FakeClient(),
+        chunk_source=chunk_source,
+    )
+    # 128_000 - min(8000, 8192) - 4_000 safety margin.
+    assert session._max_deep_tokens() == 128_000 - 8_000 - 4_000
+
+
+def test_agentaus_max_deep_tokens_uses_smaller_of_chat_and_output_cap() -> None:
+    chunk_source = FakeChunkSource([])
+    session = ChatSession(
+        FakeRetriever([]),
+        settings=_agentaus_settings(chat_max_tokens=20_000, agentaus_max_output_tokens=4_000),
+        client=FakeClient(),
+        chunk_source=chunk_source,
+    )
+    assert session._max_deep_tokens() == 128_000 - 4_000 - 4_000
+
+
+def test_agentaus_max_deep_tokens_floors_at_small_positive_number() -> None:
+    chunk_source = FakeChunkSource([])
+    session = ChatSession(
+        FakeRetriever([]),
+        settings=_agentaus_settings(agentaus_context_tokens=1_000, agentaus_max_output_tokens=500),
+        client=FakeClient(),
+        chunk_source=chunk_source,
+    )
+    assert session._max_deep_tokens() > 0
+
+
+def test_anthropic_max_deep_tokens_unchanged() -> None:
+    session = ChatSession(FakeRetriever([]), settings=_settings(), client=FakeClient())
+    assert session._max_deep_tokens() == 600_000
+
+
+def test_agentaus_deep_refuses_over_derived_limit_mentions_context_window() -> None:
+    settings = _agentaus_settings(agentaus_context_tokens=1_000, agentaus_max_output_tokens=100)
+    limit = settings.agentaus_context_tokens - min(settings.chat_max_tokens, 100) - 4_000
+    # Force a positive but small limit so a modest chunk exceeds it.
+    assert limit <= 1_000  # sanity: floor kicks in, limit is the floor value
+    huge_chunk = _deep_chunk(
+        "huge", week=1, source_type=SourceType.PPTX, source_path="w1/a.pptx", text="x" * 20_000
+    )
+    chunk_source = FakeChunkSource([huge_chunk])
+    client = FakeClient(stream_responses=[])
+    session = ChatSession(
+        FakeRetriever([]), settings=settings, client=client, chunk_source=chunk_source
+    )
+
+    with pytest.raises(ChatError, match="context window"):
+        session.ask("question", mode="deep")
+
+    assert client.messages.stream_calls == []
+
+
 def test_deep_scope_switch_citations_map_to_new_scope_not_old() -> None:
     old_chunks = [
         _deep_chunk("old-a", week=1, source_type=SourceType.PPTX, source_path="w1/a.pptx"),

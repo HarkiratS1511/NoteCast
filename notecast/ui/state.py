@@ -10,7 +10,7 @@ import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from notecast.chat.pricing import estimate_cost
+from notecast.chat.pricing import estimate_cost, provider_label
 from notecast.chat.session import ChatSession
 from notecast.ingest import manifest as manifest_mod
 from notecast.ingest.course import CourseConfig, infer_week, load_course_config
@@ -175,34 +175,60 @@ def format_usd(usd: float | None) -> str:
     return f"${usd:.2f}"
 
 
+# Shown in place of "$0.00" when an estimate can't be priced (AgentAUS with
+# no configured prices) -- "$0.00" would misleadingly suggest it's free.
+_COST_NA_HINT = "n/a (set NOTECAST_AGENTAUS_PRICE_* to estimate)"
+
+
+def _format_cost_estimate(usd: float | None) -> str:
+    if usd is None:
+        return _COST_NA_HINT
+    return f"~{format_usd(usd)}"
+
+
 def deep_cost_breakdown(
     session: ChatSession, filters: SearchFilters | None
-) -> tuple[int, float, float]:
+) -> tuple[int, float | None, float | None]:
     """Tokens, first-question cost and per-follow-up cost for deep mode
     over `filters`'s scope. Raises `ChatError` if the scope is empty/too big
     (see `ChatSession.estimate_deep_cost`).
+
+    A cost is None when it can't be estimated (e.g. AgentAUS with no
+    configured prices) -- callers should show that as "n/a", not "$0.00".
+    AgentAUS has no prompt caching, so both figures are the same flat
+    per-question cost rather than a cache-write/cache-read pair.
     """
     tokens, _total = session.estimate_deep_cost(filters)
-    model = session.settings.deep_model
-    first_cost = estimate_cost(model, {"cache_write_tokens": tokens}) or 0.0
-    follow_up_cost = estimate_cost(model, {"cache_read_tokens": tokens}) or 0.0
+    settings = session.settings
+    model = settings.deep_model
+    if settings.provider == "agentaus":
+        cost = estimate_cost(model, {"input_tokens": tokens}, settings=settings)
+        return tokens, cost, cost
+    first_cost = estimate_cost(model, {"cache_write_tokens": tokens})
+    follow_up_cost = estimate_cost(model, {"cache_read_tokens": tokens})
     return tokens, first_cost, follow_up_cost
 
 
-def format_deep_estimate(tokens: int, first_cost: float, follow_up_cost: float) -> str:
+def format_deep_estimate(
+    tokens: int, first_cost: float | None, follow_up_cost: float | None
+) -> str:
     return (
         f"Deep mode will send ~{tokens:,} tokens of material: "
-        f"~{format_usd(first_cost)} for the first question, "
-        f"~{format_usd(follow_up_cost)} for each follow-up in this scope."
+        f"{_format_cost_estimate(first_cost)} for the first question, "
+        f"{_format_cost_estimate(follow_up_cost)} for each follow-up in this scope."
     )
 
 
 def format_overview_estimate(
-    total_tokens: int, n_sources: int, low_usd: float, high_usd: float
+    total_tokens: int, n_sources: int, low_usd: float | None, high_usd: float | None
 ) -> str:
+    if low_usd is None or high_usd is None:
+        cost_text = _COST_NA_HINT
+    else:
+        cost_text = f"{format_usd(low_usd)}–{format_usd(high_usd)}"
     return (
         f"~{total_tokens:,} tokens of material across {n_sources} source(s). "
-        f"Estimated cost: {format_usd(low_usd)}–{format_usd(high_usd)}."
+        f"Estimated cost: {cost_text}."
     )
 
 
@@ -243,7 +269,30 @@ def filter_chunks(chunks: list, filters: SearchFilters | None) -> list:
 
 
 def api_key_configured(settings: Settings) -> bool:
+    """Whether the active provider has everything it needs to make a call:
+    AgentAUS needs its API key, base URL and model; Claude just needs its
+    API key.
+    """
+    if settings.provider == "agentaus":
+        return bool(
+            settings.agentaus_api_key and settings.agentaus_base_url and settings.agentaus_model
+        )
     return bool(settings.anthropic_api_key)
+
+
+def missing_api_key_hint(settings: Settings) -> str:
+    """A short, provider-aware hint naming the env vars to set, for the
+    "not configured" warning next to `api_key_configured`.
+    """
+    if settings.provider == "agentaus":
+        return (
+            "AGENTAUS_API_KEY / AGENTAUS_BASE_URL / NOTECAST_AGENTAUS_MODEL are not fully set. "
+            "Add them to your .env file to use chat and audio overviews."
+        )
+    return (
+        "ANTHROPIC_API_KEY is not set. Add it to your .env file as "
+        "ANTHROPIC_API_KEY=sk-ant-... to use chat and audio overviews."
+    )
 
 
 __all__ = [
@@ -259,6 +308,8 @@ __all__ = [
     "format_overview_estimate",
     "format_usd",
     "group_sources_by_week",
+    "missing_api_key_hint",
+    "provider_label",
     "sanitize_filename",
     "save_uploaded_file",
     "unique_destination",

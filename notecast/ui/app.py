@@ -176,12 +176,11 @@ def _render_sidebar() -> str | None:
         st.write(f"Deep model: `{settings.deep_model}`")
         st.write(f"Embedding model: `{settings.embedding_model}` ({settings.embedding_backend})")
         if state.api_key_configured(settings):
-            st.success("ANTHROPIC_API_KEY is set.")
+            st.success(f"{state.provider_label(settings)} API access is configured.")
         else:
-            st.warning(
-                "ANTHROPIC_API_KEY is not set. Add it to your .env file as "
-                "ANTHROPIC_API_KEY=sk-ant-... to use chat and audio overviews."
-            )
+            st.warning(state.missing_api_key_hint(settings))
+
+    st.sidebar.caption(f"LLM: {state.provider_label(settings)} · {settings.chat_model}")
 
     history = st.session_state.get("chat_history", {}).get(selected_slug, [])
     total_cost = sum(a.usage.est_cost_usd or 0.0 for a in history)
@@ -196,8 +195,9 @@ def _render_sidebar() -> str | None:
 def _render_answer(answer: ChatAnswer) -> None:
     st.markdown(answer.text)
     if answer.not_in_sources:
+        label = state.provider_label(get_settings())
         st.info(
-            "Not in your course material. Try Open mode for Claude's general "
+            f"Not in your course material. Try Open mode for {label}'s general "
             "knowledge and web search."
         )
     if answer.citations:
@@ -481,7 +481,10 @@ def _render_audio_tab(nb: Notebook, slug: str) -> None:
         st.session_state[confirm_key] = True
 
     if st.session_state.get(confirm_key):
-        st.warning("This calls the Claude API and may cost money. Continue?")
+        st.warning(
+            f"This calls the {state.provider_label(get_settings())} API and may cost money. "
+            "Continue?"
+        )
         col1, col2 = st.columns(2)
         if col1.button("Yes, generate", key=f"confirm_generate_yes_{slug}"):
             st.session_state[confirm_key] = False

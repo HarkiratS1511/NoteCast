@@ -281,6 +281,7 @@ def _fake_answer(
 
 
 class _FakeDeepSettings:
+    provider = "anthropic"
     deep_model = "claude-sonnet-5"
 
 
@@ -903,6 +904,114 @@ def test_audio_render_missing_script_file(tmp_notebooks_root: Path) -> None:
     result = runner.invoke(app, ["audio-render", "my-course", str(missing)])
     assert result.exit_code == 1
     assert "No script file" in result.output
+
+
+# --- provider-check -----------------------------------------------------
+
+
+class _FakeUsage:
+    def __init__(self, input_tokens: int, output_tokens: int) -> None:
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+
+
+class _FakeTextBlock:
+    def __init__(self, text: str) -> None:
+        self.type = "text"
+        self.text = text
+
+
+class _FakeMessage:
+    def __init__(self, text: str, input_tokens: int = 5, output_tokens: int = 1) -> None:
+        self.content = [_FakeTextBlock(text)]
+        self.usage = _FakeUsage(input_tokens, output_tokens)
+
+
+class _FakeProviderCheckMessages:
+    def __init__(self, response) -> None:  # noqa: ANN001
+        self._response = response
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):  # noqa: ANN001, ANN201
+        self.calls.append(kwargs)
+        if isinstance(self._response, Exception):
+            raise self._response
+        return self._response
+
+
+class _FakeProviderCheckClient:
+    def __init__(self, response, models: list[str] | None = None) -> None:
+        self.messages = _FakeProviderCheckMessages(response)
+        self._models = models
+
+    def list_models(self) -> list[str]:
+        return self._models or []
+
+
+def test_provider_check_success_prints_reply_and_usage(
+    tmp_notebooks_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import notecast.cli as cli_mod
+
+    fake_client = _FakeProviderCheckClient(_FakeMessage("ok"), models=["m-1", "m-2"])
+    monkeypatch.setattr(cli_mod, "get_client", lambda settings: fake_client)
+
+    result = runner.invoke(app, ["provider-check"])
+
+    assert result.exit_code == 0
+    assert "Provider:" in result.output
+    assert "Available models: m-1, m-2" in result.output
+    assert "Reply: 'ok'" in result.output
+    assert "Usage: input=5, output=1" in result.output
+
+
+def test_provider_check_no_list_models_skips_that_section(
+    tmp_notebooks_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import notecast.cli as cli_mod
+
+    class _NoListModelsClient:
+        def __init__(self) -> None:
+            self.messages = _FakeProviderCheckMessages(_FakeMessage("ok"))
+
+    monkeypatch.setattr(cli_mod, "get_client", lambda settings: _NoListModelsClient())
+
+    result = runner.invoke(app, ["provider-check"])
+
+    assert result.exit_code == 0
+    assert "Available models" not in result.output
+
+
+def test_provider_check_missing_api_key_exits_1(
+    tmp_notebooks_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import notecast.cli as cli_mod
+    from notecast.chat.client import MissingApiKeyError
+
+    def _raise(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        raise MissingApiKeyError()
+
+    monkeypatch.setattr(cli_mod, "get_client", _raise)
+
+    result = runner.invoke(app, ["provider-check"])
+
+    assert result.exit_code == 1
+    assert "ANTHROPIC_API_KEY" in result.output
+
+
+def test_provider_check_chat_error_on_request_exits_1(
+    tmp_notebooks_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import notecast.cli as cli_mod
+    from notecast.chat.client import ChatError
+
+    fake_client = _FakeProviderCheckClient(ChatError("boom"))
+    monkeypatch.setattr(cli_mod, "get_client", lambda settings: fake_client)
+
+    result = runner.invoke(app, ["provider-check"])
+
+    assert result.exit_code == 1
+    assert "boom" in result.output
 
 
 def test_ui_launches_streamlit_with_app_path(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -155,6 +155,16 @@ def test_app_loads_notebook_and_tabs(notebook_with_index: Notebook) -> None:
     assert len(at.tabs) == 2
 
 
+def test_sidebar_shows_active_provider_and_model(notebook_with_index: Notebook) -> None:
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+
+    assert not at.exception
+    captions = "\n".join(c.value for c in at.sidebar.caption)
+    assert "LLM: Claude" in captions
+    assert get_settings().chat_model in captions
+
+
 def test_chat_tab_renders_answer_and_citation(
     notebook_with_index: Notebook, monkeypatch: pytest.MonkeyPatch
 ) -> None:

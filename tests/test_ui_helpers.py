@@ -191,6 +191,20 @@ def test_format_overview_estimate() -> None:
     assert "$0.20" in text
 
 
+def test_format_deep_estimate_shows_na_hint_instead_of_zero_when_unpriced() -> None:
+    text = state.format_deep_estimate(12_345, None, None)
+    assert "$0.00" not in text
+    assert "n/a" in text
+    assert "NOTECAST_AGENTAUS_PRICE" in text
+
+
+def test_format_overview_estimate_shows_na_hint_instead_of_zero_when_unpriced() -> None:
+    text = state.format_overview_estimate(10_000, 3, None, None)
+    assert "$0.00" not in text
+    assert "n/a" in text
+    assert "NOTECAST_AGENTAUS_PRICE" in text
+
+
 def _chunk(source_path: str, week: int | None, source_type: SourceType = SourceType.TXT) -> Chunk:
     return Chunk(
         chunk_id=f"{source_path}-{week}",
@@ -232,6 +246,89 @@ def test_api_key_configured(tmp_notebooks_root: Path, monkeypatch: pytest.Monkey
 
     assert state.api_key_configured(Settings(anthropic_api_key="sk-ant-x")) is True
     assert state.api_key_configured(Settings(anthropic_api_key=None)) is False
+
+
+def test_api_key_configured_agentaus_needs_key_url_and_model() -> None:
+    from notecast.config import Settings
+
+    full = Settings(
+        _env_file=None,
+        provider="agentaus",
+        agentaus_api_key="key",
+        agentaus_base_url="https://example.test/v1",
+        agentaus_model="trellis-large",
+    )
+    assert state.api_key_configured(full) is True
+
+    missing_url = Settings(
+        _env_file=None,
+        provider="agentaus",
+        agentaus_api_key="key",
+        agentaus_base_url=None,
+        agentaus_model="trellis-large",
+    )
+    assert state.api_key_configured(missing_url) is False
+
+
+def test_missing_api_key_hint_provider_aware() -> None:
+    from notecast.config import Settings
+
+    anthropic_hint = state.missing_api_key_hint(Settings(_env_file=None, provider="anthropic"))
+    assert "ANTHROPIC_API_KEY" in anthropic_hint
+
+    agentaus_hint = state.missing_api_key_hint(Settings(_env_file=None, provider="agentaus"))
+    assert "AGENTAUS_API_KEY" in agentaus_hint
+    assert "AGENTAUS_BASE_URL" in agentaus_hint
+    assert "NOTECAST_AGENTAUS_MODEL" in agentaus_hint
+
+
+def test_provider_label() -> None:
+    from notecast.config import Settings
+
+    assert state.provider_label(Settings(_env_file=None, provider="anthropic")) == "Claude"
+    assert state.provider_label(Settings(_env_file=None, provider="agentaus")) == "AgentAUS"
+
+
+def test_deep_cost_breakdown_agentaus_no_cache_discount() -> None:
+    from notecast.config import Settings
+
+    class _FakeDeepSession:
+        settings = Settings(
+            _env_file=None,
+            provider="agentaus",
+            agentaus_api_key="key",
+            agentaus_base_url="https://example.test/v1",
+            agentaus_model="trellis-large",
+            agentaus_price_input_per_mtok=3.0,
+            agentaus_price_output_per_mtok=15.0,
+        )
+
+        def estimate_deep_cost(self, filters=None):  # noqa: ANN001
+            return 1_000_000, 0.0
+
+    tokens, first_cost, follow_up_cost = state.deep_cost_breakdown(_FakeDeepSession(), None)
+    assert tokens == 1_000_000
+    assert first_cost == follow_up_cost == pytest.approx(3.0)
+
+
+def test_deep_cost_breakdown_agentaus_none_when_unpriced() -> None:
+    from notecast.config import Settings
+
+    class _FakeDeepSession:
+        settings = Settings(
+            _env_file=None,
+            provider="agentaus",
+            agentaus_api_key="key",
+            agentaus_base_url="https://example.test/v1",
+            agentaus_model="trellis-large",
+        )
+
+        def estimate_deep_cost(self, filters=None):  # noqa: ANN001
+            return 1_000, 0.0
+
+    _tokens, first_cost, follow_up_cost = state.deep_cost_breakdown(_FakeDeepSession(), None)
+    assert first_cost is None
+    assert follow_up_cost is None
 
 
 # --- components.py -----------------------------------------------------

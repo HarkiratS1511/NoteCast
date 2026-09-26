@@ -22,9 +22,10 @@ from notecast.audio.service import (
     render_saved_script,
 )
 from notecast.audio.tts import InvalidVoiceError, TTSUnavailableError
-from notecast.chat.client import ChatError, MissingApiKeyError
+from notecast.chat.client import ChatError, MissingApiKeyError, get_client
 from notecast.chat.models import ChatAnswer, ChatMode
 from notecast.chat.pricing import estimate_cost as estimate_api_cost
+from notecast.chat.pricing import provider_label
 from notecast.chat.session import ChatSession
 from notecast.config import get_settings
 from notecast.eval.retrieval import format_report, load_eval_cases, run_retrieval_eval
@@ -232,6 +233,12 @@ def _make_filters(weeks: list[int]) -> SearchFilters | None:
     return SearchFilters(weeks=list(weeks)) if weeks else None
 
 
+def _format_cost_or_na(cost: float | None) -> str:
+    if cost is None:
+        return "n/a (set NOTECAST_AGENTAUS_PRICE_* to estimate)"
+    return f"${cost:.4f}"
+
+
 def _print_answer(answer: ChatAnswer) -> None:
     typer.echo(answer.text)
     if answer.not_in_sources:
@@ -242,7 +249,7 @@ def _print_answer(answer: ChatAnswer) -> None:
         typer.echo(answer.citations_markdown())
     usage = answer.usage
     total_tokens = usage.input_tokens + usage.output_tokens
-    cost = f"${usage.est_cost_usd:.4f}" if usage.est_cost_usd is not None else "n/a"
+    cost = _format_cost_or_na(usage.est_cost_usd)
     typer.echo("")
     typer.secho(f"[{total_tokens} tokens, est cost {cost}]", dim=True)
 
@@ -314,12 +321,18 @@ def _confirm_deep_mode(
     if confirmed_tokens is not None and tokens <= confirmed_tokens:
         return True, confirmed_tokens
 
-    model = session.settings.deep_model
-    first_cost = estimate_api_cost(model, {"cache_write_tokens": tokens}) or 0.0
-    follow_up_cost = estimate_api_cost(model, {"cache_read_tokens": tokens}) or 0.0
+    settings = session.settings
+    model = settings.deep_model
+    if settings.provider == "agentaus":
+        cost = estimate_api_cost(model, {"input_tokens": tokens}, settings=settings)
+        first_cost, follow_up_cost = cost, cost
+    else:
+        first_cost = estimate_api_cost(model, {"cache_write_tokens": tokens})
+        follow_up_cost = estimate_api_cost(model, {"cache_read_tokens": tokens})
     typer.echo(
         f"Deep mode will send ~{tokens:,} tokens: "
-        f"~${first_cost:.4f} first question, ~${follow_up_cost:.4f} per follow-up."
+        f"{_format_cost_or_na(first_cost)} first question, "
+        f"{_format_cost_or_na(follow_up_cost)} per follow-up."
     )
     if yes:
         return True, tokens
@@ -587,7 +600,7 @@ def _warn_if_stale(stale_chunk_ids: list[str]) -> None:
 
 @app.command("audio-render")
 def audio_render(slug: str, script_json: Path) -> None:
-    """Re-render a previously saved script (no Claude API calls)."""
+    """Re-render a previously saved script (no LLM API calls)."""
     notebook = _load_notebook_or_exit(slug)
     if not script_json.exists():
         typer.echo(f"No script file at {script_json}")
@@ -614,6 +627,68 @@ def audio_render(slug: str, script_json: Path) -> None:
     _warn_if_stale(saved.stale_chunk_ids)
     typer.echo(f"Audio: {saved.render.mp3_path}")
     typer.echo(f"Transcript: {saved.render.transcript_path}")
+
+
+def _get_field(obj: object, key: str, default: object = None) -> object:
+    """Read `key` off `obj`, whether it's a dict-like fake response (used in
+    tests) or a real SDK object with attributes.
+    """
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+@app.command("provider-check")
+def provider_check() -> None:
+    """Check the active LLM provider's configuration with a live request."""
+    settings = get_settings()
+    typer.echo(f"Provider: {provider_label(settings)} ({settings.provider})")
+    if settings.provider == "agentaus":
+        typer.echo(f"Base URL: {settings.agentaus_base_url}")
+    typer.echo(f"Chat model:   {settings.chat_model}")
+    typer.echo(f"Helper model: {settings.helper_model}")
+    typer.echo(f"Script model: {settings.script_model}")
+    typer.echo(f"Deep model:   {settings.deep_model}")
+
+    try:
+        client = get_client(settings)
+    except MissingApiKeyError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from None
+
+    if hasattr(client, "list_models"):
+        try:
+            models = client.list_models()
+        except ChatError as exc:
+            typer.echo(f"Could not list models: {exc}")
+        else:
+            typer.echo(f"Available models: {', '.join(models)}")
+
+    typer.echo("")
+    typer.echo("Sending a test request...")
+    try:
+        message = client.messages.create(
+            model=settings.chat_model,
+            max_tokens=20,
+            system="Reply with the single word: ok",
+            messages=[{"role": "user", "content": "ping"}],
+        )
+    except (MissingApiKeyError, ChatError) as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from None
+
+    text = "".join(
+        _get_field(block, "text", "") or ""
+        for block in _get_field(message, "content", []) or []
+        if _get_field(block, "type") == "text"
+    ).strip()
+    usage = _get_field(message, "usage")
+    input_tokens = _get_field(usage, "input_tokens")
+    output_tokens = _get_field(usage, "output_tokens")
+    typer.echo(f"Reply: {text!r}")
+    typer.echo(f"Usage: input={input_tokens}, output={output_tokens}")
 
 
 @app.command("ui")
