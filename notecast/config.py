@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     helper_model: str = "claude-haiku-4-5"
     script_model: str = "claude-sonnet-5"
     deep_model: str = "claude-sonnet-5"
+    # Effort for chat answers (low | medium | high); lower = cheaper and faster.
+    chat_effort: Literal["low", "medium", "high"] = "medium"
+    chat_max_tokens: int = 8000
+    # Max web searches Claude may run per question in "open" mode.
+    web_search_max_uses: int = 3
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     # "fastembed" = real local ONNX model; "hashing" = tiny offline stand-in (tests only).
     embedding_backend: Literal["fastembed", "hashing"] = "fastembed"
