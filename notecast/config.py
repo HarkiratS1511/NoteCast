@@ -45,21 +45,27 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("AGENTAUS_API_KEY", "NOTECAST_AGENTAUS_API_KEY"),
     )
-    # OpenAI-compatible base URL, including the /v1 suffix.
+    # OpenAI-compatible base URL. Note the /api prefix: plain /v1 redirects to login.
     agentaus_base_url: str | None = Field(
-        default=None,
+        default="https://agentaus.com.au/api/v1",
         validation_alias=AliasChoices("AGENTAUS_BASE_URL", "NOTECAST_AGENTAUS_BASE_URL"),
     )
     # Model ID used for every role unless a role's model is set explicitly.
-    agentaus_model: str | None = None
-    # Optional cheaper/faster model for query rewriting and helper calls.
+    # `/models` lists only this one; the server replies as "agentaus".
+    agentaus_model: str | None = "agentaus.v1"
+    # Optional separate model for query rewriting and helper calls (none exists yet).
     agentaus_helper_model: str | None = None
-    # Model context window; deep mode refuses material that won't fit.
-    agentaus_context_tokens: int = 128_000
-    # Cap applied to every request's max_tokens (servers reject larger values).
+    # Model context window (input + output); requests over it get HTTP 400.
+    agentaus_context_tokens: int = 131_072
+    # Upper bound we send as max_tokens and budget for. The server ignores
+    # max_tokens and self-limits to roughly 2,500 words (~7k tokens incl. reasoning).
     agentaus_max_output_tokens: int = 8192
     # Send response_format={"type": "json_object"} when JSON is required.
+    # Accepted but not enforced by AgentAUS, so replies are validated and retried.
     agentaus_json_mode: bool = True
+    # Send `system_prompt_overwrite: true` so our system prompt replaces Trellis's
+    # hidden ~2,400-token default instructions on every call.
+    agentaus_system_prompt_overwrite: bool = True
     agentaus_timeout_seconds: float = 600.0
     # Optional prices (USD per million tokens) for cost estimates.
     agentaus_price_input_per_mtok: float | None = None
