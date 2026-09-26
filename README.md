@@ -10,7 +10,7 @@ Drop your lectures, workshops, tutorials, slides, and transcripts into a per-cou
 
 There's no chat attachment limit because your material lives in a local index. Claude only sees the passages relevant to each question, or a whole week's content when that's what the task needs.
 
-> **Status:** planning. See [`docs/PLAN.md`](docs/PLAN.md) for the architecture, build phases, and open decisions.
+> **Status:** Phase 0 (scaffold). See [`docs/PLAN.md`](docs/PLAN.md) for the architecture, build phases, and open decisions.
 
 ## How it works (short version)
 
@@ -41,30 +41,43 @@ Audio overviews use the same grounding, then script ► Kokoro TTS (two voices) 
 ## Layout (planned)
 
 ```
-notecast/            # Python package
-  ingest/            # parsers + chunker
-  index/             # embeddings + LanceDB
-  chat/              # retrieval + Claude calls
-  audio/             # script gen + TTS
-notebooks/<course>/  # your material (git-ignored)
-  sources/           # raw files you drop in
-  processed/         # extracted text + manifest
+notecast/                   # Python package
+  ingest/                   # parsers + chunker
+  index/                    # embeddings + LanceDB
+  chat/                     # retrieval + Claude calls
+  audio/                    # script gen + TTS
+notebooks/<course>/         # your material — git-ignored, never uploaded
+  sources/                  # raw files you drop in (any nesting, e.g. week-01/)
+  processed/                # extracted text + manifest, for debugging
+  index.lancedb/            # this course's search index
+  audio/                    # generated overviews
 tests/
 docs/PLAN.md
 ```
 
-## Setup
+## Quickstart
 
-Coming once Phase 1 lands. It will look roughly like:
+New to command-line dev tools, or on a fresh Windows machine? Start with the
+full step-by-step guide: **[`docs/SETUP-WINDOWS.md`](docs/SETUP-WINDOWS.md)**.
+Want to understand *why* NoteCast is built this way (chunks, embeddings, RAG,
+citations)? See **[`docs/LEARN.md`](docs/LEARN.md)**, which grows alongside
+the code, one section per build phase.
+
+If you already have `uv` installed:
 
 ```bash
 uv sync
-cp .env.example .env        # add ANTHROPIC_API_KEY
-notecast add-course comp3000
-notecast ingest comp3000
-notecast chat comp3000
+cp .env.example .env                 # add ANTHROPIC_API_KEY later, not needed yet
+uv run notecast notebooks create comp3000
+# copy your files into notebooks/comp3000/sources/
+uv run notecast notebooks list
+uv run notecast --help
 ```
 
 ## Privacy
 
-Course material, indexes, and generated audio are git-ignored and stay on your machine. Only the retrieved passages for each request are sent to the Claude API.
+Course material, indexes, and generated audio live under `notebooks/` and are
+**git-ignored — they are never committed**, because this repository is
+**public** and your course material is copyrighted. Nothing in that folder
+ever leaves your machine except the specific passages a request needs, sent
+to the Claude API to generate an answer or a script.
