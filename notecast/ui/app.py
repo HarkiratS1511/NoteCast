@@ -29,16 +29,58 @@ from notecast.ui import components, state
 
 st.set_page_config(page_title="NoteCast", page_icon="📓", layout="wide")
 
+# The "midnight notebook" dark palette: the same paper/ink metaphor as the
+# light theme in theme.css, just inverted -- a warm dark charcoal page (not
+# pure black, not blue-tinted), muted warm ruled lines, a desaturated warm
+# red margin rule, warm off-white ink, and an accent lifted to stay legible
+# on a dark background. Kept here (not duplicated in theme.css) so there is
+# exactly one place these values live; `_inject_theme()` re-declares the same
+# `:root` custom properties theme.css defines, injected as a second
+# `<style>` block *after* the base file so it wins the cascade -- no DOM
+# attribute or JS needed. `.streamlit/config.toml` keeps `base="light"`
+# regardless: it only seeds colors for Streamlit's own native widget chrome
+# (buttons, inputs, the toggle's track), and those still read fine against
+# either palette, so there's no dark-mode-specific counterpart to maintain.
+#
+# `--on-accent` is the text color used *on top of* `--accent` fills (primary
+# buttons, hovered buttons, citation-flag badges -- see theme.css). Light
+# mode's #fff8ec on #b5433d is ~5.19:1 (WCAG AA). #e07856 is lighter than
+# #b5433d, so that same cream text would drop to ~2.85:1 and fail AA -- we
+# redeclare `--on-accent` here to the dark palette's own paper-bg color
+# (#26201a) instead, which reads as a warm "ink cutout" on the amber accent
+# and measures ~5.38:1 against #e07856 (AA pass, normal text).
+_DARK_THEME_OVERRIDES = """
+:root {
+  --paper-bg: #26201a;
+  --paper-line: #3a3129;
+  --paper-margin: #8a4a42;
+  --ink: #f0e6d2;
+  --ink-soft: #c9bda0;
+  --accent: #e07856;
+  --accent-soft: #3d2f22;
+  --sidebar-bg: #201a15;
+  --card-bg: #2f2820;
+  --card-border: #45392c;
+  --on-accent: #26201a;
+}
+"""
 
-def _inject_theme() -> None:
+
+def _inject_theme(dark_mode: bool) -> None:
     """Load the "paper notebook" CSS pass (colors, fonts, chat-bubble and
-    sidebar styling). Pure presentation -- see notecast/ui/theme.css.
+    sidebar styling), then, if `dark_mode` is set, layer the "midnight
+    notebook" palette on top by re-declaring the same `:root` variables in a
+    second `<style>` block injected right after -- it wins the cascade
+    without any DOM attribute or JS. Pure presentation -- see
+    notecast/ui/theme.css and `_DARK_THEME_OVERRIDES` above.
     """
     css_path = Path(__file__).parent / "theme.css"
     st.markdown(f"<style>{css_path.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
+    if dark_mode:
+        st.markdown(f"<style>{_DARK_THEME_OVERRIDES}</style>", unsafe_allow_html=True)
 
 
-_inject_theme()
+_inject_theme(st.session_state.get("notecast_dark_mode", False))
 
 
 # --- Cached-per-run helpers --------------------------------------------------
@@ -81,6 +123,7 @@ def _render_sidebar() -> str | None:
     st.sidebar.markdown(
         '<p class="notecast-tagline">your course, one notebook</p>', unsafe_allow_html=True
     )
+    st.sidebar.toggle("🌙 Midnight mode", key="notecast_dark_mode")
 
     notebooks = Notebook.list_all()
     slugs = [nb.slug for nb in notebooks]

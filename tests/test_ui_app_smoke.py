@@ -155,6 +155,28 @@ def test_app_loads_notebook_and_tabs(notebook_with_index: Notebook) -> None:
     assert len(at.tabs) == 2
 
 
+def test_dark_mode_toggle_swaps_theme_css(notebook_with_index: Notebook) -> None:
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    assert not at.exception
+
+    style_blocks = "\n".join(md.value for md in at.markdown)
+    assert "midnight mode" not in style_blocks.lower()
+    assert "#26201a" not in style_blocks  # dark override not injected by default
+
+    at.sidebar.toggle(key="notecast_dark_mode").set_value(True).run()
+    assert not at.exception
+    assert at.session_state["notecast_dark_mode"] is True
+
+    style_blocks = "\n".join(md.value for md in at.markdown)
+    assert "#26201a" in style_blocks  # dark "midnight notebook" --paper-bg override
+
+    at.sidebar.toggle(key="notecast_dark_mode").set_value(False).run()
+    assert not at.exception
+    style_blocks = "\n".join(md.value for md in at.markdown)
+    assert "#26201a" not in style_blocks
+
+
 def test_sidebar_shows_active_provider_and_model(notebook_with_index: Notebook) -> None:
     at = AppTest.from_file(APP_PATH)
     at.run()

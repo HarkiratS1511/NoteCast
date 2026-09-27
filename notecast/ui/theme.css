@@ -1,10 +1,18 @@
 /* NoteCast "paper notebook" theme.
  *
  * Loaded once via st.markdown(..., unsafe_allow_html=True) in app.py.
- * Google Fonts only (project convention). Colors are hardcoded because the
- * theme is forced to light in .streamlit/config.toml -- there is no dark
- * variant of "paper" to switch to, so no @media(prefers-color-scheme) block
- * is needed here.
+ * Google Fonts only (project convention).
+ *
+ * Colors live entirely in the `--*` custom properties in `:root` below.
+ * Every structural/layout rule after it reads those variables instead of a
+ * hardcoded color, so a "dark mode" is just a second set of variable
+ * values -- see app.py's `_inject_theme()`, which optionally appends a
+ * small `<style>` block that re-declares these same `:root` variables
+ * (the "midnight notebook" palette). Because it's injected *after* this
+ * file, the later declaration wins the cascade and overrides these
+ * defaults, with zero DOM attributes or JS required. `.streamlit/config.toml`
+ * still forces `base="light"` for Streamlit's own native widget chrome --
+ * see app.py for why that's independent of this toggle.
  *
  * A few selectors below target Streamlit's data-testid attributes because
  * there is no public class hook for that element; each is commented with
@@ -24,6 +32,7 @@
   --sidebar-bg: #f1ead6;
   --card-bg: #fffdf6;
   --card-border: #e6dcc0;
+  --on-accent: #fff8ec;
   --font-heading: "Kalam", cursive;
   --font-body: "Inter", -apple-system, "Segoe UI", sans-serif;
 }
@@ -161,12 +170,12 @@ h4,
 .stButton > button:hover,
 .stDownloadButton > button:hover {
   background: var(--accent);
-  color: #fff8ec;
+  color: var(--on-accent);
 }
 
 .stButton > button[kind="primary"] {
   background: var(--accent);
-  color: #fff8ec;
+  color: var(--on-accent);
 }
 
 /* Expanders as small note cards (citations, source files, saved episodes). */
@@ -176,11 +185,19 @@ h4,
   border-radius: 8px;
 }
 
+/* Light/dark mode toggle: keep it reading as part of the notebook rather
+ * than a bare default Streamlit control. */
+section[data-testid="stSidebar"] [data-testid="stToggle"] label p {
+  font-family: var(--font-body);
+  color: var(--ink-soft);
+  font-size: 0.92rem;
+}
+
 /* Citation numbers as small sticky-flag tabs. */
 .notecast-citation-flag {
   display: inline-block;
   background: var(--accent);
-  color: #fff8ec;
+  color: var(--on-accent);
   font-family: var(--font-body);
   font-weight: 600;
   font-size: 0.78rem;
