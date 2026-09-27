@@ -4,6 +4,8 @@ and audio overviews. Run with `streamlit run notecast/ui/app.py`.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import streamlit as st
 
 from notecast.audio.models import AudioScope
@@ -25,7 +27,18 @@ from notecast.ingest.course import display_name, load_course_config
 from notecast.notebook import Notebook
 from notecast.ui import components, state
 
-st.set_page_config(page_title="NoteCast", page_icon="🎧", layout="wide")
+st.set_page_config(page_title="NoteCast", page_icon="📓", layout="wide")
+
+
+def _inject_theme() -> None:
+    """Load the "paper notebook" CSS pass (colors, fonts, chat-bubble and
+    sidebar styling). Pure presentation -- see notecast/ui/theme.css.
+    """
+    css_path = Path(__file__).parent / "theme.css"
+    st.markdown(f"<style>{css_path.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
+
+
+_inject_theme()
 
 
 # --- Cached-per-run helpers --------------------------------------------------
@@ -65,6 +78,9 @@ def _get_chat_session(nb: Notebook, retriever):  # noqa: ANN201
 
 def _render_sidebar() -> str | None:
     st.sidebar.title("NoteCast")
+    st.sidebar.markdown(
+        '<p class="notecast-tagline">your course, one notebook</p>', unsafe_allow_html=True
+    )
 
     notebooks = Notebook.list_all()
     slugs = [nb.slug for nb in notebooks]
@@ -180,7 +196,11 @@ def _render_sidebar() -> str | None:
         else:
             st.warning(state.missing_api_key_hint(settings))
 
-    st.sidebar.caption(f"LLM: {state.provider_label(settings)} · {settings.chat_model}")
+    st.sidebar.caption(
+        f'<span class="notecast-llm-badge">LLM: {state.provider_label(settings)} · '
+        f"{settings.chat_model}</span>",
+        unsafe_allow_html=True,
+    )
 
     history = st.session_state.get("chat_history", {}).get(selected_slug, [])
     total_cost = sum(a.usage.est_cost_usd or 0.0 for a in history)
@@ -203,7 +223,11 @@ def _render_answer(answer: ChatAnswer) -> None:
     if answer.citations:
         with st.expander(f"Sources ({len(answer.citations)})"):
             for citation in answer.citations:
-                st.markdown(f"**{components.citation_heading(citation)}**")
+                st.markdown(
+                    f'<div class="notecast-citation-line">'
+                    f"<strong>{components.citation_heading(citation)}</strong></div>",
+                    unsafe_allow_html=True,
+                )
                 st.markdown(components.citation_body(citation))
     total_tokens = answer.usage.input_tokens + answer.usage.output_tokens
     st.caption(f"{state.format_usd(answer.usage.est_cost_usd)} · {total_tokens} tokens")
@@ -260,7 +284,7 @@ def _render_chat_tab(nb: Notebook, slug: str) -> None:
             _render_answer(answer)
 
     pending_key = f"pending_question_{slug}"
-    question = st.chat_input("Ask a question about your course material")
+    question = st.chat_input("✏️ Ask something about your notes...")
     if question:
         st.session_state[pending_key] = question
 

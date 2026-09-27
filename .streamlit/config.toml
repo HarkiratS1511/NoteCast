@@ -1,0 +1,9 @@
+[theme]
+# Force light/paper theme regardless of the visitor's OS dark-mode setting --
+# the "ruled notebook paper" concept only reads correctly on a light page.
+base = "light"
+primaryColor = "#b5433d"
+backgroundColor = "#faf6ec"
+secondaryBackgroundColor = "#f1ead6"
+textColor = "#2e2a24"
+font = "sans serif"

@@ -1,0 +1,190 @@
+/* NoteCast "paper notebook" theme.
+ *
+ * Loaded once via st.markdown(..., unsafe_allow_html=True) in app.py.
+ * Google Fonts only (project convention). Colors are hardcoded because the
+ * theme is forced to light in .streamlit/config.toml -- there is no dark
+ * variant of "paper" to switch to, so no @media(prefers-color-scheme) block
+ * is needed here.
+ *
+ * A few selectors below target Streamlit's data-testid attributes because
+ * there is no public class hook for that element; each is commented with
+ * why. Keep new additions to a minimum so this survives Streamlit upgrades.
+ */
+
+@import url("https://fonts.googleapis.com/css2?family=Kalam:wght@400;700&family=Inter:wght@400;500;600&display=swap");
+
+:root {
+  --paper-bg: #faf6ec;
+  --paper-line: #e4dcc4;
+  --paper-margin: #c1554d;
+  --ink: #2e2a24;
+  --ink-soft: #5b5647;
+  --accent: #b5433d;
+  --accent-soft: #f3e3c8;
+  --sidebar-bg: #f1ead6;
+  --card-bg: #fffdf6;
+  --card-border: #e6dcc0;
+  --font-heading: "Kalam", cursive;
+  --font-body: "Inter", -apple-system, "Segoe UI", sans-serif;
+}
+
+html,
+body {
+  font-family: var(--font-body);
+  color: var(--ink);
+}
+
+/* Main page: cream paper with a faint horizontal rule texture, like ruled
+ * notebook paper, plus a red margin line inset from the left edge. */
+.stApp {
+  background-color: var(--paper-bg);
+  background-image: repeating-linear-gradient(
+    to bottom,
+    transparent 0,
+    transparent 27px,
+    var(--paper-line) 28px
+  );
+}
+
+/* .main is Streamlit's stable public class for the main content column. */
+.main .block-container {
+  position: relative;
+  padding-left: 3.25rem;
+  border-left: none;
+}
+
+.main .block-container::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 2rem;
+  width: 2px;
+  background: var(--paper-margin);
+  opacity: 0.55;
+}
+
+/* Sidebar reads as the notebook's spiral-bound spine: a slightly different
+ * paper tone, a shadowed edge, and a column of small "spiral" dots. */
+section[data-testid="stSidebar"] {
+  background-color: var(--sidebar-bg);
+  box-shadow: inset -6px 0 10px -8px rgba(0, 0, 0, 0.25);
+  position: relative;
+}
+
+section[data-testid="stSidebar"]::before {
+  content: "";
+  position: absolute;
+  top: 12px;
+  bottom: 12px;
+  right: 6px;
+  width: 8px;
+  background-image: radial-gradient(circle, #b9b2a0 2.2px, transparent 2.3px);
+  background-size: 8px 26px;
+  background-repeat: repeat-y;
+  opacity: 0.6;
+}
+
+/* Headings use the handwriting font; body/content text never does. */
+h1,
+h2,
+h3,
+h4,
+.stApp [data-testid="stSidebarContent"] h1 {
+  font-family: var(--font-heading);
+  color: var(--ink);
+  letter-spacing: 0.01em;
+}
+
+.notecast-tagline {
+  font-family: var(--font-body);
+  color: var(--ink-soft);
+  font-size: 0.85rem;
+  margin-top: -0.6rem;
+  margin-bottom: 0.75rem;
+}
+
+.notecast-llm-badge {
+  display: inline-block;
+  font-family: var(--font-body);
+  font-size: 0.78rem;
+  color: var(--ink-soft);
+  background: var(--accent-soft);
+  border: 1px solid var(--card-border);
+  border-radius: 999px;
+  padding: 0.15rem 0.65rem;
+  margin-top: 0.25rem;
+}
+
+/* Chat bubbles as sticky-note / index-card blocks. */
+[data-testid="stChatMessage"] {
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  box-shadow: 1px 2px 6px rgba(60, 50, 30, 0.08);
+  padding: 0.25rem 0.5rem;
+  margin-bottom: 0.6rem;
+}
+
+/* Tabs styled as notebook dividers. */
+.stTabs [data-baseweb="tab-list"] {
+  gap: 4px;
+  border-bottom: 2px solid var(--paper-margin);
+}
+
+.stTabs [data-baseweb="tab"] {
+  background: var(--accent-soft);
+  border-radius: 8px 8px 0 0;
+  font-family: var(--font-heading);
+  font-size: 1.05rem;
+  color: var(--ink-soft);
+  padding: 0.4rem 1.1rem;
+  border: 1px solid var(--card-border);
+  border-bottom: none;
+}
+
+.stTabs [aria-selected="true"] {
+  background: var(--card-bg);
+  color: var(--accent);
+}
+
+/* Buttons: warm "ink" accent for primary actions. */
+.stButton > button,
+.stDownloadButton > button {
+  border-radius: 8px;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  background: var(--card-bg);
+  font-weight: 500;
+}
+
+.stButton > button:hover,
+.stDownloadButton > button:hover {
+  background: var(--accent);
+  color: #fff8ec;
+}
+
+.stButton > button[kind="primary"] {
+  background: var(--accent);
+  color: #fff8ec;
+}
+
+/* Expanders as small note cards (citations, source files, saved episodes). */
+[data-testid="stExpander"] {
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+}
+
+/* Citation numbers as small sticky-flag tabs. */
+.notecast-citation-flag {
+  display: inline-block;
+  background: var(--accent);
+  color: #fff8ec;
+  font-family: var(--font-body);
+  font-weight: 600;
+  font-size: 0.78rem;
+  border-radius: 3px 3px 0 3px;
+  padding: 0.05rem 0.4rem;
+  margin-right: 0.4rem;
+}
