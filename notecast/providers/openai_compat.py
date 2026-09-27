@@ -546,6 +546,29 @@ def _usage_int(usage: Any, primary_key: str, fallback_key: str) -> int:
     return value or 0
 
 
+def _check_completion_shape(completion: Any) -> None:
+    """The `openai` SDK falls back to returning the raw response body
+    (often a bare string) instead of raising when a server's reply isn't a
+    valid `ChatCompletion` JSON object -- e.g. a non-JSON body, an HTTP-200
+    error payload, or a shape AgentAUS's endpoint doesn't actually produce.
+    Turn that into a readable `ChatError` instead of a confusing
+    `AttributeError` deep inside response translation.
+    """
+    choices = getattr(completion, "choices", None)
+    if isinstance(choices, list) and choices:
+        return
+    if isinstance(completion, (bytes, bytearray)):
+        completion = completion.decode("utf-8", errors="replace")
+    snippet = str(completion).strip()
+    if len(snippet) > 500:
+        snippet = snippet[:500] + "... (truncated)"
+    raise ChatError(
+        "AgentAUS's response wasn't in the expected format (no 'choices' in the "
+        f"reply). This usually means the server rejected the request or returned "
+        f"an error as plain text instead of JSON. Raw response: {snippet or '(empty)'}"
+    )
+
+
 def _translate_response(
     completion: Any,
     *,
@@ -553,6 +576,7 @@ def _translate_response(
     json_requested: bool,
     parse_model: type | None,
 ) -> Message:
+    _check_completion_shape(completion)
     choice = completion.choices[0]
     message = choice.message
     raw_text = _bget(message, "content", "") or ""

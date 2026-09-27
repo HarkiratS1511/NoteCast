@@ -1302,3 +1302,31 @@ def test_chat_session_over_agentaus_adapter_with_citations() -> None:
 def test_content_sentences_with_generic_task_words_not_stripped(first_line: str) -> None:
     text = f"{first_line}\nMore content follows here."
     assert _strip_leaked_reasoning(text) == text
+
+
+def test_non_chat_completion_response_raises_readable_chat_error() -> None:
+    """A server reply the openai SDK can't parse into a ChatCompletion (e.g.
+    a non-JSON or malformed body) surfaces as a readable ChatError instead
+    of an AttributeError deep in response translation.
+    """
+    fake = FakeOpenAI(responses=["not a real completion body"])
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    with pytest.raises(ChatError, match="AgentAUS's response wasn't in the expected format"):
+        client.messages.create(
+            model="agentaus.v1",
+            max_tokens=20,
+            system="hi",
+            messages=[{"role": "user", "content": "ping"}],
+        )
+
+
+def test_non_chat_completion_response_includes_truncated_raw_text() -> None:
+    fake = FakeOpenAI(responses=["x" * 800])
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    with pytest.raises(ChatError, match="truncated"):
+        client.messages.create(
+            model="agentaus.v1",
+            max_tokens=20,
+            system="hi",
+            messages=[{"role": "user", "content": "ping"}],
+        )
