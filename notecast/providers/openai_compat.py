@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import openai
@@ -546,6 +547,78 @@ def _usage_int(usage: Any, primary_key: str, fallback_key: str) -> int:
     return value or 0
 
 
+def _parse_sse_completion(text: str) -> Any | None:
+    """Parse a Server-Sent-Events chat-completion-chunk stream (the shape
+    AgentAUS sends back even for a non-streaming request) into a plain
+    object with the same `.choices[0].message.content` / `.usage` shape
+    `_translate_response` expects from a normal `ChatCompletion`.
+
+    Returns None if `text` doesn't contain any parseable `data: {...}`
+    chunks at all, so the caller can fall back to treating it as an
+    unrecognised response.
+    """
+    content_parts: list[str] = []
+    finish_reason: str | None = None
+    usage_obj: dict[str, Any] | None = None
+    model: str | None = None
+    completion_id: str | None = None
+    saw_chunk = False
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:") :].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        saw_chunk = True
+        model = obj.get("model") or model
+        completion_id = obj.get("id") or completion_id
+        for choice in obj.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta") or {}
+            piece = delta.get("content")
+            if piece:
+                content_parts.append(piece)
+            fr = choice.get("finish_reason")
+            if fr:
+                finish_reason = fr
+        chunk_usage = obj.get("usage")
+        if isinstance(chunk_usage, dict):
+            usage_obj = chunk_usage
+
+    if not saw_chunk:
+        return None
+
+    message = SimpleNamespace(content="".join(content_parts), role="assistant")
+    choice = SimpleNamespace(message=message, finish_reason=finish_reason or "stop")
+    usage_ns = SimpleNamespace(**usage_obj) if usage_obj else None
+    return SimpleNamespace(choices=[choice], usage=usage_ns, id=completion_id, model=model)
+
+
+def _coerce_sse_completion(completion: Any) -> Any:
+    """If `completion` is the raw SSE text the `openai` SDK falls back to
+    returning when a server streams chunks for what we asked as a
+    non-streaming request, parse it into a completion-shaped object.
+    Anything else (already a real `ChatCompletion`, or text that isn't an
+    SSE chunk stream) passes through unchanged.
+    """
+    if isinstance(completion, (bytes, bytearray)):
+        completion = completion.decode("utf-8", errors="replace")
+    if isinstance(completion, str) and "data:" in completion:
+        parsed = _parse_sse_completion(completion)
+        if parsed is not None:
+            return parsed
+    return completion
+
+
 def _check_completion_shape(completion: Any) -> None:
     """The `openai` SDK falls back to returning the raw response body
     (often a bare string) instead of raising when a server's reply isn't a
@@ -754,16 +827,23 @@ class OpenAICompatClient:
         fallback: if the server 400s while `response_format` was sent, retry
         once without it and remember that on this instance so later calls
         never send it again.
+
+        AgentAUS streams `data: {...}` chunks back even for this
+        non-streaming call; the `openai` SDK can't parse that as a
+        `ChatCompletion` and falls back to returning the raw text, which
+        `_coerce_sse_completion` turns back into a completion-shaped object.
         """
         try:
-            return self._client.chat.completions.create(**request)
+            return _coerce_sse_completion(self._client.chat.completions.create(**request))
         except openai.BadRequestError as exc:
             if send_response_format:
                 self._skip_response_format = True
                 retry_request = dict(request)
                 retry_request.pop("response_format", None)
                 try:
-                    return self._client.chat.completions.create(**retry_request)
+                    return _coerce_sse_completion(
+                        self._client.chat.completions.create(**retry_request)
+                    )
                 except openai.OpenAIError as retry_exc:
                     raise map_openai_error(retry_exc, self._settings) from retry_exc
             raise map_openai_error(exc, self._settings) from exc

@@ -1330,3 +1330,85 @@ def test_non_chat_completion_response_includes_truncated_raw_text() -> None:
             system="hi",
             messages=[{"role": "user", "content": "ping"}],
         )
+
+
+_REAL_AGENTAUS_SSE_SAMPLE = (
+    'data: {"choices":[{"delta":{"content":"ok\\n\\n","role":"assistant"},'
+    '"finish_reason":null,"index":0,"text":"ok\\n\\n"}],"created":1790502532,'
+    '"id":"resp_264279","model":"agentaus","object":"chat.completion.chunk"}\n'
+    "\n"
+    'data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],'
+    '"created":1790502532,"id":"resp_264279","model":"agentaus",'
+    '"object":"chat.completion.chunk","usage":null}\n'
+    "\n"
+    'data: {"choices":[],"created":1790502532,"id":"resp_264279",'
+    '"model":"agentaus","object":"chat.completion.chunk",'
+    '"usage":{"input_tokens":9,"output_tokens":3}}\n'
+    "\n"
+    "data: [DONE]\n"
+)
+
+
+def test_agentaus_sse_stream_response_parsed_as_completion() -> None:
+    """AgentAUS streams `data: {...}` chunks back even for a plain
+    (non-streaming) chat.completions.create call. The adapter must read
+    that instead of surfacing the raw text as an error.
+    """
+    fake = FakeOpenAI(responses=[_REAL_AGENTAUS_SSE_SAMPLE])
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.create(
+        model="agentaus.v1",
+        max_tokens=20,
+        system="Reply with the single word: ok",
+        messages=[{"role": "user", "content": "ping"}],
+    )
+    assert message.content[0].text.strip() == "ok"
+    assert message.stop_reason == "end_turn"
+    assert message.usage.input_tokens == 9
+    assert message.usage.output_tokens == 3
+
+
+class _SseFallbackAnswer(BaseModel):
+    answer: str
+
+
+def test_sse_stream_parsing_via_response_format_fallback_path() -> None:
+    """The same SSE coercion applies on the response_format-400 retry path."""
+    bad_request_response = httpx2.Response(
+        400, request=httpx2.Request("POST", "https://agentaus.example.com/v1/chat/completions")
+    )
+    sse_json_body = _REAL_AGENTAUS_SSE_SAMPLE.replace(
+        '"content":"ok\\n\\n"', '"content":"{\\"answer\\": \\"ok\\"}"'
+    )
+    fake = FakeOpenAI(
+        responses=[
+            openai.BadRequestError(
+                "response_format not supported", response=bad_request_response, body=None
+            ),
+            sse_json_body,
+        ]
+    )
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    message = client.messages.parse(
+        model="agentaus.v1",
+        max_tokens=20,
+        system="hi",
+        messages=[{"role": "user", "content": "ping"}],
+        output_format=_SseFallbackAnswer,
+    )
+    assert message.parsed_output == _SseFallbackAnswer(answer="ok")
+
+
+def test_non_sse_non_json_string_still_raises_readable_error() -> None:
+    """Plain text that isn't an SSE chunk stream at all still surfaces as
+    the readable ChatError, not a silently-wrong parse.
+    """
+    fake = FakeOpenAI(responses=["Internal Server Error: upstream timed out"])
+    client = OpenAICompatClient(_settings(), openai_client=fake)
+    with pytest.raises(ChatError, match="AgentAUS's response wasn't in the expected format"):
+        client.messages.create(
+            model="agentaus.v1",
+            max_tokens=20,
+            system="hi",
+            messages=[{"role": "user", "content": "ping"}],
+        )
