@@ -11,8 +11,12 @@
  * (the "midnight notebook" palette). Because it's injected *after* this
  * file, the later declaration wins the cascade and overrides these
  * defaults, with zero DOM attributes or JS required. `.streamlit/config.toml`
- * still forces `base="light"` for Streamlit's own native widget chrome --
- * see app.py for why that's independent of this toggle.
+ * still forces `base="light"`, which only sets the *initial* seed colors for
+ * Streamlit's native widget chrome (header bar, selectbox/multiselect,
+ * inputs, dropdown portals, their labels) -- the "Native Streamlit widget
+ * chrome" section near the bottom of this file re-skins that chrome from
+ * the same `--*` variables so it follows the dark-mode swap too. See
+ * app.py's `_DARK_THEME_OVERRIDES` for the dark values of those variables.
  *
  * A few selectors below target Streamlit's data-testid attributes because
  * there is no public class hook for that element; each is commented with
@@ -33,6 +37,13 @@
   --card-bg: #fffdf6;
   --card-border: #e6dcc0;
   --on-accent: #fff8ec;
+  /* Native Streamlit widget chrome (header bar, selectbox/multiselect,
+   * text/number inputs, dropdown portals) is skinned separately from the
+   * custom card/sidebar/tab styling above, using these two variables, so
+   * it can be re-tuned without hunting for hardcoded hex values. See the
+   * `[data-testid]`/ARIA-role rules below. */
+  --input-bg: #fffdf6;
+  --input-border: #d9cda3;
   --font-heading: "Kalam", cursive;
   --font-body: "Inter", -apple-system, "Segoe UI", sans-serif;
 }
@@ -94,11 +105,19 @@ section[data-testid="stSidebar"]::before {
   opacity: 0.6;
 }
 
-/* Headings use the handwriting font; body/content text never does. */
-h1,
-h2,
-h3,
-h4,
+/* Headings use the handwriting font; body/content text never does.
+ * `.stApp` is prepended to every selector here (not just the sidebar one)
+ * so this beats Streamlit's own per-heading `.st-emotion-cache-*` class
+ * rule, which sets a *fixed* font/color from `.streamlit/config.toml`'s
+ * theme, on specificity (one class + one element beats one class alone) --
+ * a bare `h1` tag selector loses that fight. In light mode this was
+ * invisible because the fixed native text color happens to equal light
+ * mode's `--ink`; in dark mode it left page titles (e.g. the notebook
+ * name) rendering in the wrong color and font entirely. */
+.stApp h1,
+.stApp h2,
+.stApp h3,
+.stApp h4,
 .stApp [data-testid="stSidebarContent"] h1 {
   font-family: var(--font-heading);
   color: var(--ink);
@@ -135,13 +154,15 @@ h4,
   margin-bottom: 0.6rem;
 }
 
-/* Tabs styled as notebook dividers. */
-.stTabs [data-baseweb="tab-list"] {
+/* Tabs styled as notebook dividers. Current Streamlit exposes these via
+ * `[role="tablist"]`/`[data-testid="stTab"]`, not BaseWeb's old
+ * `data-baseweb="tab-list"`/`"tab"` markers. */
+.stTabs [role="tablist"] {
   gap: 4px;
   border-bottom: 2px solid var(--paper-margin);
 }
 
-.stTabs [data-baseweb="tab"] {
+.stTabs [data-testid="stTab"] {
   background: var(--accent-soft);
   border-radius: 8px 8px 0 0;
   font-family: var(--font-heading);
@@ -204,4 +225,191 @@ section[data-testid="stSidebar"] [data-testid="stToggle"] label p {
   border-radius: 3px 3px 0 3px;
   padding: 0.05rem 0.4rem;
   margin-right: 0.4rem;
+}
+
+/* --- Native Streamlit widget chrome -------------------------------------
+ * Everything below targets DOM Streamlit renders itself (not our custom
+ * markup), using its `data-testid` hooks (and, where there's no testid on
+ * the element that actually needs it, a stable ARIA `role`/attribute) --
+ * the same class of selector used above for the sidebar/chat/tab/expander
+ * shells. This Streamlit version builds several of these controls
+ * (selectbox, multiselect, their dropdown portals, radio) on
+ * react-aria-components rather than BaseWeb, so `[data-baseweb=...]`
+ * selectors that would work on older Streamlit silently match nothing
+ * here -- checked against the live DOM, not assumed. It exists because
+ * `.streamlit/config.toml` seeds fixed light-theme colors
+ * (and a fixed native text color) for this chrome that the dark-mode
+ * palette swap above never reached, so in dark mode the header bar,
+ * selectbox/multiselect, inputs and their labels stayed cream/dark-on-dark
+ * even once the page background went dark. Reading `var(--*)` here means
+ * these rules are a no-op in light mode (they resolve to the same colors
+ * config.toml already sets) and follow the dark palette automatically once
+ * `_DARK_THEME_OVERRIDES` redeclares those variables.
+ */
+
+/* Header bar (Deploy / hamburger menu, top right). Its "Deploy" text and
+ * menu icon are colored from Streamlit's own fixed native text color too
+ * (see the widget-label comment below), so they need the same treatment
+ * as the background or they render dark-on-dark once the header itself
+ * goes dark. */
+[data-testid="stHeader"] {
+  background-color: var(--paper-bg);
+}
+
+[data-testid="stHeader"] * {
+  color: var(--ink) !important;
+}
+
+/* Widget labels: "Notebook", "Mode", "Weeks", "Week (optional...)", etc.
+ * Streamlit colors these from its own (fixed) theme text color, not our
+ * CSS, so without this override they stay dark-on-dark once the dark
+ * palette below is active. */
+[data-testid="stWidgetLabel"] p,
+[data-testid="stWidgetLabel"] label,
+[data-testid="stCaptionContainer"] p {
+  color: var(--ink) !important;
+}
+
+/* Text input / number input / text area / chat input: the actual <input>/
+ * <textarea> field. */
+.stTextInput input,
+.stNumberInput input,
+.stTextArea textarea,
+[data-testid="stChatInput"] textarea,
+[data-testid="stChatInput"] input {
+  background-color: var(--input-bg);
+  color: var(--ink);
+  border: 1px solid var(--input-border);
+}
+
+[data-testid="stChatInput"] {
+  background-color: var(--input-bg);
+  border-color: var(--input-border);
+}
+
+/* Like the text/number input, the chat input's pill-shaped wrapper (the
+ * rounded bar holding the textarea + send button) paints its own separate
+ * background one layer in from the textarea styled above. */
+[data-testid="stChatInput"] > div {
+  background-color: var(--input-bg);
+}
+
+/* Send button: recolor as a small primary action (matches .stButton's
+ * primary-kind accent fill elsewhere) so its arrow icon -- an SVG using
+ * `fill: currentColor` -- reads clearly against the dark pill instead of
+ * as a dark icon on the fixed light button background. */
+[data-testid="stChatInputSubmitButton"] {
+  background-color: var(--accent);
+  color: var(--on-accent);
+}
+
+/* The text/number input's own OUTER wrapper paints a second, separate
+ * background behind/around the field above (it's what shows as the
+ * control's border ring) -- current Streamlit no longer uses BaseWeb's
+ * `data-baseweb` markers for this, so it needs its own testid selector or
+ * it's left showing the fixed light background around an otherwise-dark
+ * field. */
+[data-testid="stTextInputRootElement"],
+[data-testid="stNumberInputContainer"] {
+  background-color: var(--input-bg);
+  border-color: var(--input-border);
+}
+
+/* Number input +/- stepper buttons. */
+[data-testid="stNumberInput"] button {
+  background-color: var(--input-bg);
+  border-color: var(--input-border);
+  color: var(--ink);
+}
+
+/* Selectbox / multiselect: closed control. Current Streamlit builds these
+ * on react-aria-components, not BaseWeb, so the closed control is an
+ * ARIA `role="group"` wrapper (no stable class/testid of its own) rather
+ * than a `[data-baseweb="select"]` node. */
+[data-testid="stSelectbox"] [role="group"],
+[data-testid="stMultiSelect"] [role="group"] {
+  background-color: var(--input-bg);
+  border-color: var(--input-border);
+}
+
+[data-testid="stSelectbox"] [role="group"] *,
+[data-testid="stMultiSelect"] [role="group"] * {
+  color: var(--ink);
+}
+
+/* Dropdown/popover menu (selectbox + multiselect options list). This
+ * renders in a portal appended to <body>, outside the sidebar/main DOM
+ * tree the rest of this file styles, so it needs its own top-level
+ * selector rather than a nested one. Both the selectbox's and the
+ * multiselect's portal share the `*VirtualDropdown` testid suffix. */
+[data-testid$="VirtualDropdown"] {
+  background-color: var(--input-bg);
+  border: 1px solid var(--input-border);
+}
+
+[data-testid$="VirtualDropdown"] [role="option"] {
+  color: var(--ink);
+  background-color: transparent;
+}
+
+[data-testid$="VirtualDropdown"] [role="option"]:hover,
+[data-testid$="VirtualDropdown"] [role="option"][data-focused="true"] {
+  background-color: var(--accent-soft);
+}
+
+/* Radio buttons (chat "Mode": Sources only / Open / Deep). */
+[data-testid="stRadio"] label p,
+[data-testid="stRadio"] div {
+  color: var(--ink);
+}
+
+[data-testid="stRadio"] label div:first-child {
+  border-color: var(--input-border);
+  background-color: var(--input-bg);
+}
+
+[data-testid="stRadio"] label input:checked + div {
+  border-color: var(--accent);
+}
+
+[data-testid="stRadio"] label input:checked + div > div {
+  background-color: var(--accent);
+}
+
+/* File uploader drop zone and its "Browse files" button. */
+[data-testid="stFileUploaderDropzone"] {
+  background-color: var(--input-bg);
+  border: 1px dashed var(--input-border);
+}
+
+[data-testid="stFileUploaderDropzone"] span,
+[data-testid="stFileUploaderDropzone"] small,
+[data-testid="stFileUploaderDropzone"] div {
+  color: var(--ink-soft);
+}
+
+[data-testid="stFileUploaderDropzone"] button,
+[data-testid="stBaseButton-secondary"] {
+  background-color: var(--card-bg);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+}
+
+/* Slider label (audio overview "Max length"). */
+[data-testid="stSlider"] label p {
+  color: var(--ink);
+}
+
+/* Expander summary text (already dark-boxed via [data-testid="stExpander"]
+ * above; its header text color is separately theme-controlled). */
+[data-testid="stExpander"] summary p,
+[data-testid="stExpander"] summary span,
+[data-testid="stExpander"] summary svg {
+  color: var(--ink);
+  fill: var(--ink);
+}
+
+/* Alert boxes (st.info/success/warning/error): body text and icon. */
+[data-testid="stAlert"] {
+  color: var(--ink);
 }

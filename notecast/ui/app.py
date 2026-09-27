@@ -37,10 +37,12 @@ st.set_page_config(page_title="NoteCast", page_icon="📓", layout="wide")
 # exactly one place these values live; `_inject_theme()` re-declares the same
 # `:root` custom properties theme.css defines, injected as a second
 # `<style>` block *after* the base file so it wins the cascade -- no DOM
-# attribute or JS needed. `.streamlit/config.toml` keeps `base="light"`
-# regardless: it only seeds colors for Streamlit's own native widget chrome
-# (buttons, inputs, the toggle's track), and those still read fine against
-# either palette, so there's no dark-mode-specific counterpart to maintain.
+# attribute or JS needed. `.streamlit/config.toml` still keeps `base="light"`
+# -- that only sets the *initial* seed colors Streamlit's native widget
+# chrome (header bar, selectbox/multiselect, inputs, dropdown portals, their
+# labels) renders with; theme.css's `[data-testid]`/`[data-baseweb]` rules
+# read the same `--*` variables redeclared below to override that chrome for
+# dark mode too, so nothing is left seeded to the config.toml light colors.
 #
 # `--on-accent` is the text color used *on top of* `--accent` fills (primary
 # buttons, hovered buttons, citation-flag badges -- see theme.css). Light
@@ -49,6 +51,10 @@ st.set_page_config(page_title="NoteCast", page_icon="📓", layout="wide")
 # redeclare `--on-accent` here to the dark palette's own paper-bg color
 # (#26201a) instead, which reads as a warm "ink cutout" on the amber accent
 # and measures ~5.38:1 against #e07856 (AA pass, normal text).
+#
+# `--input-bg`/`--input-border` skin native widget chrome (see theme.css);
+# reusing the card colors keeps inputs reading as the same "index card"
+# surface as chat bubbles and expanders rather than a third, unrelated tone.
 _DARK_THEME_OVERRIDES = """
 :root {
   --paper-bg: #26201a;
@@ -62,6 +68,8 @@ _DARK_THEME_OVERRIDES = """
   --card-bg: #2f2820;
   --card-border: #45392c;
   --on-accent: #26201a;
+  --input-bg: #2f2820;
+  --input-border: #5c4c3a;
 }
 """
 
